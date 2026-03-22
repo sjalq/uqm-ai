@@ -39,7 +39,11 @@ class SigLIPEncoder(nn.Module):
             raise ImportError("open_clip is required: pip install open-clip-torch")
         model, _, self.preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
         self.visual = model.visual
-        self.output_dim = self.visual.output_dim
+        if hasattr(self.visual, 'output_dim'):
+            self.output_dim = self.visual.output_dim
+        else:
+            with torch.no_grad():
+                self.output_dim = self.visual(torch.randn(1, 3, 224, 224)).shape[-1]
         for param in self.visual.parameters():
             param.requires_grad = False
         self.visual.eval()

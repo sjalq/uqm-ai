@@ -15,6 +15,9 @@ import logging
 import os
 from pathlib import Path
 
+# Prevent SDL window from appearing - use offscreen rendering
+os.environ['SDL_VIDEODRIVER'] = 'offscreen'
+
 logger = logging.getLogger(__name__)
 
 ffi = cffi.FFI()
