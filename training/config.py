@@ -1,8 +1,8 @@
 """
 Training configuration - all hyperparameters in one place.
 
-Agent 2 - Round 2: Curriculum learning + action masking + entropy annealing.
-Builds on Round 1 lightweight CNN. Shorter rollouts, higher initial LR, fewer epochs.
+Round 2 Agent 3: Frame stacking + tuned hyperparameters.
+Builds on Round 1 lightweight CNN with 4-frame temporal awareness.
 """
 
 from dataclasses import dataclass, field
@@ -42,7 +42,10 @@ class TrainingConfig:
     hidden_dim: int = 256
     action_dim: int = 32
 
-    learning_rate: float = 7e-4       # Higher initial LR for faster convergence
+    # Frame stacking: number of consecutive grayscale frames as CNN input
+    frame_stack: int = 4
+
+    learning_rate: float = 7e-4
     num_steps: int = 64               # Shorter rollouts = more frequent updates
     num_minibatches: int = 4
     update_epochs: int = 3            # Fewer epochs per update = faster wall-clock
@@ -57,7 +60,7 @@ class TrainingConfig:
     ent_coef_final: float = 0.005
 
     # Curriculum learning: phase 1 uses restricted combat actions, phase 2 uses all 32
-    curriculum_phase1_steps: int = 80_000   # Steps before expanding to full action space
+    curriculum_phase1_steps: int = 80_000
     combat_actions: List[int] = field(default_factory=lambda: list(COMBAT_ACTIONS))
 
     total_timesteps: int = 1_000_000
@@ -73,7 +76,7 @@ class TrainingConfig:
     log_dir: str = "logs"
 
     # Reward shaping parameters
-    reward_damage_dealt_scale: float = 3.0   # Asymmetric: reward dealing damage 3x
-    reward_damage_taken_scale: float = 1.0   # Penalize taking damage 1x
-    reward_combo_bonus: float = 0.05         # Bonus per consecutive-hit step
-    reward_survival_bonus: float = 0.0005    # Small per-step survival reward
+    reward_damage_dealt_scale: float = 3.0
+    reward_damage_taken_scale: float = 1.0
+    reward_combo_bonus: float = 0.05
+    reward_survival_bonus: float = 0.0005

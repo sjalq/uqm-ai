@@ -1,8 +1,8 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Agent 1 - Round 2: Dense reward shaping with combo tracking, asymmetric damage,
-and efficiency-scaled terminal rewards on top of Round 1's fast CNN architecture.
+Round 2 combined: Dense reward shaping (Agent 1), curriculum learning + action masking +
+entropy annealing (Agent 2), frame stacking (Agent 3).
 """
 
 import time
@@ -97,9 +97,13 @@ def train(config: TrainingConfig):
         minibatch_size = batch_size // config.num_minibatches
         num_updates = config.total_timesteps // batch_size
         input_size = agent.input_size
-        in_channels = 1 if agent.encoder_type != "siglip" else 3
+        frame_stack = getattr(agent, "frame_stack", 1)
+        if agent.encoder_type == "siglip":
+            obs_channels = 3
+        else:
+            obs_channels = frame_stack
 
-        obs_buf = torch.zeros((config.num_steps, config.num_envs, in_channels, input_size, input_size), dtype=torch.float32)
+        obs_buf = torch.zeros((config.num_steps, config.num_envs, obs_channels, input_size, input_size), dtype=torch.float32)
         actions_buf = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long)
         logprobs_buf = torch.zeros((config.num_steps, config.num_envs))
         rewards_buf = torch.zeros((config.num_steps, config.num_envs))
@@ -108,13 +112,27 @@ def train(config: TrainingConfig):
 
         reward_shaper = RewardShaper(config.num_envs, config)
 
+        # Frame stacking: maintain per-env frame buffers for CNN path
+        # Each buffer is (frame_stack, H, W) on CPU
+        frame_bufs = None
+        if frame_stack > 1 and agent.encoder_type != "siglip":
+            frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32)
+
         next_obs_list = []
         next_done = torch.zeros(config.num_envs)
         for i, env in enumerate(envs):
             obs, info = env.reset()
             next_obs_list.append(obs)
             reward_shaper.reset_env(i, info)
-        next_obs_processed = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+        # Preprocess to single-channel grayscale
+        next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+        # Initialize frame buffers by repeating first frame
+        if frame_bufs is not None:
+            for i in range(config.num_envs):
+                frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
+            next_obs_processed = frame_bufs.clone()
+        else:
+            next_obs_processed = next_obs_single
 
         # Curriculum learning: start with restricted combat actions, expand later
         has_curriculum = hasattr(config, "curriculum_phase1_steps") and hasattr(config, "combat_actions")
@@ -128,7 +146,8 @@ def train(config: TrainingConfig):
         ent_coef_final = getattr(config, "ent_coef_final", config.ent_coef)
 
         budget = getattr(config, "wall_clock_budget", 290.0)
-        logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates})")
+        logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack})")
+        logger.info(f"Entropy annealing: {ent_coef_start} -> {ent_coef_final}")
 
         use_amp = (device.type == "cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -188,7 +207,18 @@ def train(config: TrainingConfig):
                         reward_shaper.reset_env(i, info)
                     next_obs_list.append(obs)
 
-                next_obs_processed = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+                next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+                if frame_bufs is not None:
+                    for i in range(config.num_envs):
+                        if next_done[i]:
+                            # Reset frame buffer on episode end
+                            frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
+                        else:
+                            # Shift left (drop oldest), append new frame
+                            frame_bufs[i] = torch.cat([frame_bufs[i, 1:], next_obs_single[i, 0:1]], dim=0)
+                    next_obs_processed = frame_bufs.clone()
+                else:
+                    next_obs_processed = next_obs_single
 
             with torch.no_grad():
                 next_value = agent.get_value(next_obs_processed.to(device)).squeeze(-1).cpu()
@@ -203,7 +233,7 @@ def train(config: TrainingConfig):
                     advantages[t] = lastgaelam = delta + config.gamma * config.gae_lambda * nnt * lastgaelam
                 returns = advantages + values_buf
 
-            b_obs = obs_buf.reshape(-1, in_channels, input_size, input_size)
+            b_obs = obs_buf.reshape(-1, obs_channels, input_size, input_size)
             b_logprobs = logprobs_buf.reshape(-1)
             b_actions = actions_buf.reshape(-1)
             b_advantages = advantages.reshape(-1)
@@ -249,10 +279,12 @@ def train(config: TrainingConfig):
 
             elapsed = time.time() - start_time
             sps = int(global_step / max(elapsed, 1))
+            phase_str = "Ph1" if (has_curriculum and not curriculum_expanded) else "Ph2"
             log_entry = {
                 "global_step": global_step, "wall_clock_seconds": elapsed, "sps": sps,
                 "pg_loss": pg_loss.item(), "v_loss": v_loss.item(), "entropy": entropy_loss.item(),
-                "lr": lr, "clipfrac": np.mean(clipfracs) if clipfracs else 0.0,
+                "lr": lr, "ent_coef": current_ent_coef, "phase": phase_str,
+                "clipfrac": np.mean(clipfracs) if clipfracs else 0.0,
             }
 
             if global_step % config.eval_interval < batch_size:
@@ -260,7 +292,7 @@ def train(config: TrainingConfig):
                     win_rate, eval_metrics = evaluate_agent(agent, config, device)
                     log_entry["win_rate"] = win_rate
                     log_entry.update(eval_metrics)
-                    logger.info(f"Step {global_step:>8d} | Win: {win_rate:.0%} | SPS: {sps} | Loss: {loss.item():.4f} | {elapsed:.0f}s")
+                    logger.info(f"Step {global_step:>8d} | Win: {win_rate:.0%} | SPS: {sps} | Loss: {loss.item():.4f} | Ent: {current_ent_coef:.4f} | {phase_str} | {elapsed:.0f}s")
                     if win_rate > best_win_rate:
                         best_win_rate = win_rate
                         best_eval_metrics = eval_metrics
@@ -271,7 +303,7 @@ def train(config: TrainingConfig):
                 else:
                     logger.info(f"Step {global_step:>8d} | SPS: {sps} | Skip eval (budget low)")
             elif update % 10 == 0:
-                logger.info(f"Step {global_step:>8d} | SPS: {sps} | Loss: {loss.item():.4f}")
+                logger.info(f"Step {global_step:>8d} | SPS: {sps} | Loss: {loss.item():.4f} | Ent: {current_ent_coef:.4f} | {phase_str}")
 
             training_log.append(log_entry)
             if update % 10 == 0:
@@ -290,6 +322,8 @@ def train(config: TrainingConfig):
     finally:
         results = _save_results(config, global_step, start_time, best_win_rate, competency_reached_at, training_log, best_eval_metrics)
         if agent is not None:
+            # Clear action mask for clean eval-ready checkpoint
+            agent.set_action_mask(None)
             try:
                 torch.save(agent.state_dict(), os.path.join(config.checkpoint_dir, "final.pt"))
             except Exception:
@@ -320,6 +354,9 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
     agent.eval()
     try:
         for ep in range(config.eval_episodes):
+            # Reset frame buffer for clean eval episodes
+            if hasattr(agent, "reset_frame_buffer"):
+                agent.reset_frame_buffer()
             try:
                 obs, info = env.reset()
             except Exception:
