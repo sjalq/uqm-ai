@@ -36,7 +36,7 @@ class TrainingConfig:
     ship_p2: int = 5
     p2_cyborg: bool = True
     frame_skip: int = 4
-    num_envs: int = 16              # R3A2: doubled from 8 for more diverse experience
+    num_envs: int = 1               # R8A2: single env, maximize update frequency
 
     encoder_name: str = "ViT-B-16-SigLIP"
     encoder_pretrained: str = "webli"
@@ -47,10 +47,10 @@ class TrainingConfig:
     # Frame stacking: number of consecutive grayscale frames as CNN input
     frame_stack: int = 4
 
-    learning_rate: float = 7e-4
-    num_steps: int = 128             # R3A2: doubled from 64 for larger rollouts, fewer updates
-    num_minibatches: int = 8         # R3A2: scaled with num_envs to keep minibatch_size constant
-    update_epochs: int = 3
+    learning_rate: float = 1e-3      # R8A2: higher LR for fast learning
+    num_steps: int = 8               # R8A2: tiny rollouts, maximum update frequency
+    num_minibatches: int = 1         # R8A2: single minibatch (batch_size=8)
+    update_epochs: int = 8           # R8A2: more epochs per update
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
@@ -67,9 +67,9 @@ class TrainingConfig:
 
     total_timesteps: int = 1_000_000
     wall_clock_budget: float = 290.0
-    eval_interval: int = 40_000      # R3A2: less frequent eval (was 20k)
-    eval_episodes: int = 5           # R3A2: fewer eval episodes (was 10)
-    checkpoint_interval: int = 80_000  # R3A2: less frequent checkpoints
+    eval_interval: int = 999999      # R8A2: disable eval during training
+    eval_episodes: int = 5
+    checkpoint_interval: int = 999999  # R8A2: disable checkpoints during training
 
     target_win_rate: float = 0.8
 
@@ -84,7 +84,7 @@ class TrainingConfig:
     reward_survival_bonus: float = 0.0005
 
     # R3A2: Throughput optimizations
-    use_torch_compile: bool = True    # torch.compile on encoder
+    use_torch_compile: bool = False   # R8A2: disable, overhead not worth it for tiny batches
     pin_memory: bool = True           # pin rollout buffers for faster GPU transfer
     gpu_preprocess: bool = True       # do preprocessing on GPU
 
@@ -94,5 +94,5 @@ class TrainingConfig:
     use_cosine_lr: bool = True        # Cosine LR annealing (R3A3, better for short budgets)
     use_lr_warmup: bool = True        # LR warmup (R3A1)
     lr_warmup_frac: float = 0.05     # Fraction of updates for warmup
-    use_reward_normalization: bool = True   # RunningMeanStd reward normalization (R3A1)
+    use_reward_normalization: bool = False  # R8A2: disable, raw rewards for tiny batches
     use_clipped_vloss: bool = True    # Clipped value loss (R3A1)
