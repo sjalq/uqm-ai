@@ -83,9 +83,51 @@ python -m evaluation.scoring --results outputs/results.json
 
 RTX 5060 Ti 16GB (SM_120). May need PyTorch nightly. SigLIP encoder is frozen so VRAM usage is ~2-4GB for training.
 
+## ROBUSTNESS - READ THIS CAREFULLY
+
+This system is designed to run UNATTENDED for hours or days. The user will walk away and come back. NOTHING may crash, hang, or require human intervention.
+
+### Every process you launch MUST:
+
+- Catch ALL exceptions at the top level and log them instead of crashing
+- Use timeouts on every blocking operation (file I/O, network, subprocess, semaphores)
+- Write progress to disk periodically so work is never lost if something dies
+- Be restartable/resumable - if it dies and gets restarted, it picks up where it left off
+- Never hold a lock indefinitely - use timeouts on mutexes, semaphores, file locks
+- Log to files, not just stdout - stdout scrolls away in tmux
+
+### C code (libmelee.so) MUST:
+
+- Never segfault - validate all pointers before dereferencing
+- Use signal handlers for SIGSEGV/SIGABRT that log the crash and exit cleanly
+- Have watchdog timeouts on the game loop - if DoBattle hangs, kill and restart
+- Handle SDL initialization failure gracefully (return error code, don't abort())
+- Free all resources in melee_close() even after partial initialization
+
+### Python training code MUST:
+
+- Wrap the entire training loop in try/except that saves the best checkpoint before dying
+- Checkpoint every N steps so a crash only loses minutes, not hours
+- Handle GPU OOM gracefully - catch RuntimeError, reduce batch size, retry
+- Handle libmelee.so crashes - if the C library segfaults, restart the environment
+- Use subprocess isolation for the game environment if needed (multiprocessing with spawn)
+- Write results.json incrementally, not just at the end
+
+### The evolution orchestrator MUST:
+
+- Handle agent timeouts (agent hangs forever, never touches DONE)
+- Handle training crashes (agent's code crashes mid-training)
+- Handle partial results (training died but left a checkpoint - evaluate what exists)
+- Never leave orphaned processes - track PIDs and kill everything on cleanup
+- Be idempotent - running it again after a crash doesn't corrupt state
+- Log everything to evolution/logs/ with timestamps
+
+### Teammates: when the team lead tells you to build something, YOU are responsible for making it robust. Do not write code that works in the happy path only. Handle every failure mode. The user will not be there to fix things.
+
 ## Rules
 
 - No mocks. Actually train.
 - Train from scratch each round (no loading previous weights).
 - Evaluation integrity is hash-checked.
 - One GPU shared across agents (train sequentially).
+- NEVER write code that can hang, crash, or lose progress unrecoverably.
