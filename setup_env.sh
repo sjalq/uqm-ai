@@ -6,9 +6,10 @@ echo "=== UQM Melee AI Setup ==="
 
 # System dependencies (Arch Linux)
 echo "Installing system dependencies..."
+# zlib skipped - zlib-ng-compat provides it on CachyOS/Arch
 sudo pacman -S --needed --noconfirm \
     sdl2 sdl2_image sdl2_mixer sdl2_net sdl2_ttf \
-    libvorbis libogg libpng zlib base-devel \
+    libvorbis libogg libpng base-devel \
     tmux python
 
 # Python venv
