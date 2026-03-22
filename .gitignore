@@ -7,7 +7,6 @@ venv/
 dist/
 build/
 .eggs/
-*.so
 *.o
 checkpoints/
 outputs/
@@ -15,3 +14,6 @@ logs/
 wandb/
 .claude/settings.local.json
 worktrees/
+DONE
+*.so
+!uqm_env/libmelee.so

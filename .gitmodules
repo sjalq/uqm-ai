@@ -1,0 +1,3 @@
+[submodule "uqm-megamod"]
+	path = uqm-megamod
+	url = https://github.com/sjalq/UQM-MegaMod-AI.git
