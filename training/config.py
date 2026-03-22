@@ -11,20 +11,14 @@ from dataclasses import dataclass, field
 from typing import List
 
 
-# 12 useful combat actions (indices into the 32-action space)
+# 6 essential combat actions - reduced action space for faster learning
 # Each action is a 5-bit mask: [LEFT, RIGHT, THRUST, WEAPON, SPECIAL]
 # Bit 0=LEFT(1), 1=RIGHT(2), 2=THRUST(4), 3=WEAPON(8), 4=SPECIAL(16)
 COMBAT_ACTIONS: List[int] = [
     0,   # idle
-    1,   # left
-    2,   # right
     4,   # thrust
     8,   # fire
     12,  # thrust + fire (4+8)
-    5,   # left + thrust (1+4)
-    6,   # right + thrust (2+4)
-    9,   # left + fire (1+8)
-    10,  # right + fire (2+8)
     13,  # left + thrust + fire (1+4+8)
     14,  # right + thrust + fire (2+4+8)
 ]
@@ -54,7 +48,7 @@ class TrainingConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.05
+    ent_coef: float = 0.15
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -62,7 +56,7 @@ class TrainingConfig:
     ent_coef_final: float = 0.005
 
     # Curriculum learning: phase 1 uses restricted combat actions, phase 2 uses all 32
-    curriculum_phase1_steps: int = 80_000
+    curriculum_phase1_steps: int = 999_999
     combat_actions: List[int] = field(default_factory=lambda: list(COMBAT_ACTIONS))
 
     total_timesteps: int = 1_000_000
