@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SESSION="uqm-team"
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # Preflight
 command -v tmux >/dev/null || { echo "Error: tmux not installed. Run: sudo pacman -S tmux"; exit 1; }
