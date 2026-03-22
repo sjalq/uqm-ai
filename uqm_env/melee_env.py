@@ -19,8 +19,8 @@ import traceback
 logger = logging.getLogger(__name__)
 
 # Timeout for individual step/reset calls (seconds)
-STEP_TIMEOUT = 5.0
-RESET_TIMEOUT = 10.0
+STEP_TIMEOUT = 10.0
+RESET_TIMEOUT = 60.0  # First reset loads UQM content (~20-30s)
 # Max consecutive failures before giving up
 MAX_CONSECUTIVE_FAILURES = 5
 

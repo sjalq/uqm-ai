@@ -15,8 +15,9 @@ import logging
 import os
 from pathlib import Path
 
-# Prevent SDL window from appearing - use offscreen rendering
-os.environ['SDL_VIDEODRIVER'] = 'offscreen'
+# Prevent SDL window from grabbing focus
+os.environ.setdefault('SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS', '1')
+os.environ.setdefault('SDL_HINT_NO_SIGNAL_HANDLERS', '1')
 
 logger = logging.getLogger(__name__)
 
