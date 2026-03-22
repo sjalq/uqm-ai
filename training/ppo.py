@@ -78,16 +78,22 @@ def train(config: TrainingConfig):
         for i in range(config.num_envs):
             envs.append(make_env(config, i))
 
+        frame_stack = getattr(config, "frame_stack", 4)
+
         try:
             agent = MeleeAgent(
                 encoder_type="siglip", hidden_dim=config.hidden_dim,
                 action_dim=config.action_dim, encoder_name=config.encoder_name,
                 encoder_pretrained=config.encoder_pretrained,
+                frame_stack=frame_stack,
             ).to(device)
             logger.info("Using SigLIP encoder")
         except (ImportError, RuntimeError) as e:
             logger.info(f"SigLIP unavailable ({e}), using CNN encoder")
-            agent = MeleeAgent(encoder_type="cnn", hidden_dim=config.hidden_dim, action_dim=config.action_dim).to(device)
+            agent = MeleeAgent(
+                encoder_type="cnn", hidden_dim=config.hidden_dim,
+                action_dim=config.action_dim, frame_stack=frame_stack,
+            ).to(device)
 
         trainable_params = [p for p in agent.parameters() if p.requires_grad]
         logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
@@ -97,7 +103,6 @@ def train(config: TrainingConfig):
         minibatch_size = batch_size // config.num_minibatches
         num_updates = config.total_timesteps // batch_size
         input_size = agent.input_size
-        frame_stack = getattr(agent, "frame_stack", 1)
         if agent.encoder_type == "siglip":
             obs_channels = 3
         else:
