@@ -397,7 +397,7 @@ echo "--- Verifying exported symbols ---"
 NM_FILE="$BUILD_DIR/nm_output.txt"
 nm -D "$OUTPUT" > "$NM_FILE" 2>/dev/null || true
 
-for sym in melee_init melee_step melee_close melee_get_ship_count melee_get_ship_name melee_is_active; do
+for sym in melee_lib_init melee_lib_shutdown melee_init melee_step melee_close melee_get_ship_count melee_get_ship_name melee_is_active; do
     if grep -q " T ${sym}$" "$NM_FILE" 2>/dev/null; then
         echo "  OK: $sym"
     else

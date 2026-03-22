@@ -17,6 +17,8 @@ typedef struct {
     int frame_count;
 } MeleeStepResult;
 
+int melee_lib_init(void);
+void melee_lib_shutdown(void);
 int melee_init(int ship_p1, int ship_p2, int p2_cyborg, int headless, uint32_t seed);
 MeleeStepResult melee_step(uint8_t p1_action, uint8_t p2_action);
 void melee_close(void);

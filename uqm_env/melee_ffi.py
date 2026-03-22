@@ -46,10 +46,28 @@ ACTION_SPECIAL = 1 << 4
 NUM_ACTIONS = 32
 
 
+def lib_init() -> int:
+    """Initialize UQM library subsystems. Must be called once before init().
+    Returns 0 on success. Idempotent."""
+    l = _ensure_loaded()
+    return l.melee_lib_init()
+
+
+def lib_shutdown():
+    """Shut down UQM library subsystems."""
+    l = _ensure_loaded()
+    l.melee_lib_shutdown()
+
+
 def init(ship_p1: int, ship_p2: int, p2_cyborg: bool = True,
          headless: bool = True, seed: int = 0) -> int:
-    """Initialize a melee match. Returns 0 on success."""
+    """Initialize a melee match. Returns 0 on success.
+    Automatically calls lib_init() if not already done."""
     l = _ensure_loaded()
+    # Auto-init library if needed
+    ret = l.melee_lib_init()
+    if ret != 0:
+        raise RuntimeError(f"melee_lib_init() failed with code {ret}")
     return l.melee_init(ship_p1, ship_p2, int(p2_cyborg), int(headless), seed)
 
 
