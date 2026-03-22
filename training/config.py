@@ -35,7 +35,7 @@ class TrainingConfig:
     ship_p1: int = 5
     ship_p2: int = 5
     p2_cyborg: bool = True
-    frame_skip: int = 4
+    frame_skip: int = 16             # R9A3: 4x frame_skip = 4x fewer env.step() calls
     num_envs: int = 1               # R8A1: single env, maximize steps per update
 
     encoder_name: str = "ViT-B-16-SigLIP"
@@ -48,11 +48,11 @@ class TrainingConfig:
     frame_stack: int = 4
 
     learning_rate: float = 3e-3      # R8A1: higher LR for fast learning with few steps
-    num_steps: int = 16              # R8A1: short rollouts, frequent updates
-    num_minibatches: int = 2         # R8A1: 2 minibatches of 8 steps each
-    update_epochs: int = 4           # R8A1: more epochs per update to squeeze value from each rollout
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
+    num_steps: int = 8               # R9A3: fewer steps needed with frame_skip=16 (each step = 16 game frames)
+    num_minibatches: int = 2         # R9A3: 2 minibatches of 4 steps each
+    update_epochs: int = 6           # R9A3: more epochs to extract max value from fewer rollout steps
+    gamma: float = 0.97              # R9A3: lower gamma for shorter effective episodes (fewer agent steps)
+    gae_lambda: float = 0.90         # R9A3: lower lambda, faster credit assignment with fewer steps
     clip_coef: float = 0.2
     ent_coef: float = 0.1            # R8A1: higher exploration with so few steps
     vf_coef: float = 0.5

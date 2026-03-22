@@ -3,25 +3,25 @@ Reward shaping for UQM Melee.
 
 This file is MODIFIABLE by competing agents.
 
-Agent 1 - Round 8: Aggressive reward shaping.
-+1.0 per enemy crew killed, -0.3 per own crew lost, +5.0 win, -1.0 loss, -0.01 per step.
-Simple, strong gradients to learn fast in limited steps.
+R9 Agent 3: Tuned for frame_skip=16 (each step = 16 game frames).
+With fewer agent steps per battle (~5 steps), rewards are scaled up per-step
+to maintain strong gradients. Step penalty reduced since each step spans more time.
 """
 
 
 class RewardShaper:
     """
-    Aggressive reward shaper focused on maximizing damage output.
-    Large per-crew-kill rewards create strong learning signal even with few steps.
+    Reward shaper tuned for high frame_skip (16).
+    With ~5 agent steps per battle, each step's reward signal must be strong.
     """
 
     def __init__(self, num_envs, config=None):
         self.num_envs = num_envs
-        self.crew_kill_reward = 1.0       # +1.0 per enemy crew killed
-        self.crew_lost_penalty = -0.3     # -0.3 per own crew lost
-        self.win_reward = 5.0             # +5.0 for winning
-        self.loss_penalty = -1.0          # -1.0 for losing
-        self.step_penalty = -0.01         # -0.01 per step (urgency)
+        self.crew_kill_reward = 2.0       # R9A3: stronger per-kill reward (fewer steps to learn from)
+        self.crew_lost_penalty = -0.5     # R9A3: stronger penalty
+        self.win_reward = 8.0             # R9A3: stronger terminal signal
+        self.loss_penalty = -2.0          # R9A3: stronger loss penalty
+        self.step_penalty = -0.005        # R9A3: reduced step penalty (each step = 16 frames now)
 
         # Per-env state
         self.prev_p1_crew = [0] * num_envs
