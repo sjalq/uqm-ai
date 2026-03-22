@@ -1,10 +1,11 @@
 """
 Agent network: lightweight grayscale CNN encoder + trainable actor-critic MLP heads.
 
-Round 3 Agent 2: Throughput optimizations.
-- GPU-side preprocessing function (preprocess_obs_gpu)
-- torch.compile support via try_compile()
-- All prior features preserved: frame stacking, action masking, orthogonal init
+Round 4 Agent 1: Integrated best practices from R3 losers.
+- LayerNorm on encoder output (R3A3)
+- Deeper 2-layer MLP heads: 512->128->output (R3A3)
+- All prior features preserved: frame stacking, action masking, orthogonal init,
+  GPU preprocessing, torch.compile
 """
 
 import torch
@@ -119,7 +120,7 @@ class MeleeAgent(nn.Module):
 
     def __init__(self, encoder_type="siglip", hidden_dim=256, action_dim=32,
                  encoder_name="ViT-B-16-SigLIP", encoder_pretrained="webli",
-                 frame_stack=4):
+                 frame_stack=4, use_layernorm=False, deep_heads=False):
         super().__init__()
         self.encoder_type = encoder_type
         self.action_dim = action_dim
@@ -133,16 +134,38 @@ class MeleeAgent(nn.Module):
             self.input_size = 84
 
         enc_dim = self.encoder.output_dim
-        self.actor = nn.Sequential(
-            _ortho_init(nn.Linear(enc_dim, hidden_dim), gain=np.sqrt(2)),
-            nn.ReLU(),
-            _ortho_init(nn.Linear(hidden_dim, action_dim), gain=0.01),
-        )
-        self.critic = nn.Sequential(
-            _ortho_init(nn.Linear(enc_dim, hidden_dim), gain=np.sqrt(2)),
-            nn.ReLU(),
-            _ortho_init(nn.Linear(hidden_dim, 1), gain=1.0),
-        )
+
+        # R4A1: Optional LayerNorm on encoder output for training stability (R3A3)
+        self.enc_layernorm = nn.LayerNorm(enc_dim) if use_layernorm else nn.Identity()
+
+        # R4A1: Deeper 2-layer MLP heads (R3A3) or original single-layer
+        if deep_heads:
+            mid_dim = max(hidden_dim * 2, 512)  # 512 for default hidden_dim=256
+            self.actor = nn.Sequential(
+                _ortho_init(nn.Linear(enc_dim, mid_dim), gain=np.sqrt(2)),
+                nn.ReLU(),
+                _ortho_init(nn.Linear(mid_dim, hidden_dim), gain=np.sqrt(2)),
+                nn.ReLU(),
+                _ortho_init(nn.Linear(hidden_dim, action_dim), gain=0.01),
+            )
+            self.critic = nn.Sequential(
+                _ortho_init(nn.Linear(enc_dim, mid_dim), gain=np.sqrt(2)),
+                nn.ReLU(),
+                _ortho_init(nn.Linear(mid_dim, hidden_dim), gain=np.sqrt(2)),
+                nn.ReLU(),
+                _ortho_init(nn.Linear(hidden_dim, 1), gain=1.0),
+            )
+        else:
+            self.actor = nn.Sequential(
+                _ortho_init(nn.Linear(enc_dim, hidden_dim), gain=np.sqrt(2)),
+                nn.ReLU(),
+                _ortho_init(nn.Linear(hidden_dim, action_dim), gain=0.01),
+            )
+            self.critic = nn.Sequential(
+                _ortho_init(nn.Linear(enc_dim, hidden_dim), gain=np.sqrt(2)),
+                nn.ReLU(),
+                _ortho_init(nn.Linear(hidden_dim, 1), gain=1.0),
+            )
 
         # Internal frame buffer for eval/inference (not used during training minibatch)
         self._frame_buffer = None
@@ -209,7 +232,7 @@ class MeleeAgent(nn.Module):
         if processed.shape[1] == 1 and self.encoder_type != "siglip":
             processed = self._update_frame_buffer(processed)
 
-        return self.encoder(processed)
+        return self.enc_layernorm(self.encoder(processed))
 
     def get_value(self, obs):
         return self.critic(self.get_features(obs))
