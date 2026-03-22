@@ -1,11 +1,11 @@
 """
 Agent network: lightweight grayscale CNN encoder + trainable actor-critic MLP heads.
 
-Round 2 Agent 3: Frame stacking (4 frames) for temporal awareness.
-- 4-channel input (4 stacked grayscale frames) captures velocity/direction
-- Internal frame buffer for seamless eval compatibility
-- Nature DQN CNN with orthogonal init
-- Action masking preserved from Agent 2 for curriculum learning
+Round 3 Agent 3: Architecture improvements for faster convergence.
+- LayerNorm in CNN encoder output for stable feature distribution
+- Deeper MLP heads (2 hidden layers each) with LayerNorm
+- Separate feature streams prevent actor-critic gradient interference
+- All prior features preserved: frame stacking, action masking, torch.compile, GPU preprocess
 """
 
 import torch
@@ -50,7 +50,7 @@ class SigLIPEncoder(nn.Module):
 
 
 class SimpleCNNEncoder(nn.Module):
-    """Nature DQN-style CNN. Accepts frame_stack channels (default 4) for temporal info."""
+    """Nature DQN-style CNN with LayerNorm output. Accepts frame_stack channels."""
 
     def __init__(self, input_channels=4):
         super().__init__()
@@ -59,13 +59,30 @@ class SimpleCNNEncoder(nn.Module):
         self.conv2 = _ortho_init(nn.Conv2d(32, 64, 4, stride=2), gain=np.sqrt(2))
         self.conv3 = _ortho_init(nn.Conv2d(64, 64, 3, stride=1), gain=np.sqrt(2))
         self.fc = _ortho_init(nn.Linear(3136, self.output_dim), gain=np.sqrt(2))
+        # R3A3: LayerNorm on encoder output stabilizes feature distribution for MLP heads
+        self.ln = nn.LayerNorm(self.output_dim)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = x.reshape(x.size(0), -1)
-        return F.relu(self.fc(x))
+        x = self.ln(F.relu(self.fc(x)))
+        return x
+
+
+def preprocess_obs_gpu(obs_tensor, target_size=84):
+    """
+    GPU-side preprocessing: grayscale conversion + resize.
+    Input: (B, H, W, 3) uint8 tensor on GPU
+    Output: (B, 1, target_size, target_size) float32 tensor on GPU
+    """
+    obs_float = obs_tensor.float()
+    gray = (0.2989 * obs_float[:, :, :, 0] + 0.5870 * obs_float[:, :, :, 1] + 0.1140 * obs_float[:, :, :, 2])
+    gray = gray.unsqueeze(1) / 255.0
+    if gray.shape[2] != target_size or gray.shape[3] != target_size:
+        gray = F.interpolate(gray, size=(target_size, target_size), mode="bilinear", align_corners=False)
+    return gray
 
 
 def preprocess_obs(obs, target_size=84, device="cpu"):
@@ -97,11 +114,13 @@ def preprocess_obs(obs, target_size=84, device="cpu"):
 
 class MeleeAgent(nn.Module):
     """
-    Actor-critic agent with frame stacking for temporal awareness.
+    Actor-critic agent with deeper MLP heads and LayerNorm for fast convergence.
 
-    Frame stacking: maintains internal buffer of last N grayscale frames.
-    During eval (single-frame input), the buffer auto-updates each call.
-    During training minibatch replay, pre-stacked obs bypass the buffer.
+    R3 Agent 3 architecture improvements:
+    - LayerNorm on CNN encoder output for stable feature distribution
+    - 2-layer actor and critic heads with LayerNorm in first hidden layer
+    - Wider mid-layer (hidden_dim -> hidden_dim//2) for richer representations
+    - Frame stacking + action masking + torch.compile preserved
     """
 
     def __init__(self, encoder_type="siglip", hidden_dim=256, action_dim=32,
@@ -120,21 +139,44 @@ class MeleeAgent(nn.Module):
             self.input_size = 84
 
         enc_dim = self.encoder.output_dim
+        mid_dim = hidden_dim // 2
+
+        # R3A3: Deeper actor head with LayerNorm for training stability
         self.actor = nn.Sequential(
             _ortho_init(nn.Linear(enc_dim, hidden_dim), gain=np.sqrt(2)),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            _ortho_init(nn.Linear(hidden_dim, action_dim), gain=0.01),
+            _ortho_init(nn.Linear(hidden_dim, mid_dim), gain=np.sqrt(2)),
+            nn.ReLU(),
+            _ortho_init(nn.Linear(mid_dim, action_dim), gain=0.01),
         )
+
+        # R3A3: Deeper critic head with LayerNorm
         self.critic = nn.Sequential(
             _ortho_init(nn.Linear(enc_dim, hidden_dim), gain=np.sqrt(2)),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            _ortho_init(nn.Linear(hidden_dim, 1), gain=1.0),
+            _ortho_init(nn.Linear(hidden_dim, mid_dim), gain=np.sqrt(2)),
+            nn.ReLU(),
+            _ortho_init(nn.Linear(mid_dim, 1), gain=1.0),
         )
 
         # Internal frame buffer for eval/inference (not used during training minibatch)
         self._frame_buffer = None
         # Action mask: None means all actions allowed
         self._action_mask = None
+        # Flag for whether torch.compile has been applied
+        self._compiled = False
+
+    def try_compile(self):
+        """Apply torch.compile to encoder for kernel fusion speedup. Safe no-op on failure."""
+        if self._compiled:
+            return
+        try:
+            self.encoder = torch.compile(self.encoder, mode="reduce-overhead")
+            self._compiled = True
+        except Exception:
+            pass
 
     def reset_frame_buffer(self):
         """Clear frame buffer. Call on episode reset."""
@@ -147,10 +189,8 @@ class MeleeAgent(nn.Module):
         Returns: (B, frame_stack, H, W) stacked frames
         """
         if self._frame_buffer is None or self._frame_buffer.shape[0] != single_frame.shape[0]:
-            # Initialize: repeat the first frame across all stack slots
             self._frame_buffer = single_frame.repeat(1, self.frame_stack, 1, 1)
         else:
-            # Shift left (drop oldest) and append new frame
             self._frame_buffer = torch.cat([
                 self._frame_buffer[:, 1:, :, :],
                 single_frame

@@ -1,8 +1,8 @@
 """
 Training configuration - all hyperparameters in one place.
 
-Round 3 Agent 2: Maximum throughput + parallelism.
-More envs, GPU preprocessing, torch.compile, optimized rollout loop.
+Round 3 Agent 3: Architecture improvements + tuned hyperparameters.
+Deeper MLP heads with LayerNorm, wider hidden dim, adjusted LR/entropy for stability.
 """
 
 from dataclasses import dataclass, field
@@ -45,14 +45,14 @@ class TrainingConfig:
     # Frame stacking: number of consecutive grayscale frames as CNN input
     frame_stack: int = 4
 
-    learning_rate: float = 7e-4
+    learning_rate: float = 1e-3      # R3A3: higher LR, safe with LayerNorm stabilization
     num_steps: int = 128             # R3A2: doubled from 64 for larger rollouts, fewer updates
     num_minibatches: int = 8         # R3A2: scaled with num_envs to keep minibatch_size constant
-    update_epochs: int = 3
+    update_epochs: int = 4           # R3A3: one extra epoch, heads are deeper so need more passes
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.05
+    ent_coef: float = 0.08            # R3A3: more exploration early (deeper net needs it)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -76,8 +76,8 @@ class TrainingConfig:
     log_dir: str = "logs"
 
     # Reward shaping parameters
-    reward_damage_dealt_scale: float = 3.0
-    reward_damage_taken_scale: float = 1.0
+    reward_damage_dealt_scale: float = 5.0  # R3A3: stronger damage signal for faster learning
+    reward_damage_taken_scale: float = 0.5  # R3A3: reduced penalty so agent is more aggressive
     reward_combo_bonus: float = 0.05
     reward_survival_bonus: float = 0.0005
 

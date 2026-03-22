@@ -3,8 +3,8 @@ Reward shaping for UQM Melee.
 
 This file is MODIFIABLE by competing agents.
 
-Agent 1 - Round 2: Dense reward signals with combo tracking, asymmetric damage scaling,
-survival bonuses, and efficiency-scaled terminal rewards.
+Round 3 Agent 3: More aggressive damage rewards + engagement bonuses.
+Builds on R2A1 dense reward signals with tuned asymmetry for faster learning.
 """
 
 
@@ -25,10 +25,10 @@ class RewardShaper:
         self.combo_bonus = 0.05          # Bonus per consecutive-hit step
         self.combo_decay_steps = 5       # Steps before combo resets
         self.survival_bonus = 0.0005     # Small per-step survival reward
-        self.win_base = 1.0              # Base win reward
-        self.loss_base = -1.0            # Base loss penalty
+        self.win_base = 2.0              # R3A3: stronger win signal
+        self.loss_base = -0.5            # R3A3: softer loss penalty (encourage risk-taking)
         self.efficiency_scale = 0.5      # Extra reward for efficient wins
-        self.time_penalty = 0.0005       # Small time pressure
+        self.time_penalty = 0.0002       # R3A3: reduced time pressure (don't discourage exploration)
 
         if config is not None:
             self.damage_dealt_scale = getattr(config, "reward_damage_dealt_scale", self.damage_dealt_scale)

@@ -1,18 +1,20 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Round 3 Agent 1: Improved value learning + exploration.
-- Clipped value loss for stable value function updates
-- Running mean/std reward normalization
-- Hash-based exploration bonus for state coverage
-- Batch-level advantage normalization
-- LR warmup for early training stability
+Round 3 Agent 3: Architecture improvements + value learning + exploration.
+- Deeper MLP heads with LayerNorm (Agent 3)
+- Cosine LR annealing with warmup (Agent 3)
+- Clipped value loss for stable value function updates (Agent 1)
+- Running mean/std reward normalization (Agent 1)
+- Hash-based exploration bonus for state coverage (Agent 1)
+- Batch-level advantage normalization (Agent 1)
 """
 
 import time
 import os
 import json
 import logging
+import math
 import traceback
 import numpy as np
 import torch
@@ -160,7 +162,7 @@ def train(config: TrainingConfig):
                 frame_stack=frame_stack,
             ).to(device)
             logger.info("Using SigLIP encoder")
-        except (ImportError, RuntimeError) as e:
+        except (ImportError, RuntimeError, AttributeError) as e:
             logger.info(f"SigLIP unavailable ({e}), using CNN encoder")
             agent = MeleeAgent(
                 encoder_type="cnn", hidden_dim=config.hidden_dim,
@@ -248,12 +250,14 @@ def train(config: TrainingConfig):
                 logger.info(f"Budget reached at {elapsed:.1f}s")
                 break
 
-            frac = 1.0 - (update - 1.0) / num_updates
-            lr = frac * config.learning_rate
-            # LR warmup: linear ramp from 0 to scheduled LR over warmup steps
+            # R3A3: Cosine LR annealing with warmup (better than linear for short training)
+            progress = (update - 1.0) / max(num_updates, 1)
             if lr_warmup_steps > 0 and global_step < lr_warmup_steps:
-                warmup_frac = global_step / lr_warmup_steps
-                lr = lr * warmup_frac
+                # Linear warmup phase
+                lr = config.learning_rate * (global_step / lr_warmup_steps)
+            else:
+                # Cosine decay from peak to ~0
+                lr = config.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
             optimizer.param_groups[0]["lr"] = lr
 
             # Entropy annealing: linear decay from start to final
