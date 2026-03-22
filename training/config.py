@@ -1,8 +1,10 @@
 """
 Training configuration - all hyperparameters in one place.
 
-Round 3 Agent 2: Maximum throughput + parallelism.
-More envs, GPU preprocessing, torch.compile, optimized rollout loop.
+Round 4 Agent 1: Integrated best practices from R3 losers.
+- RunningMeanStd reward normalization, clipped value loss (R3A1)
+- LayerNorm, deeper MLP heads, cosine LR annealing (R3A3)
+- LR warmup for training stability (R3A1)
 """
 
 from dataclasses import dataclass, field
@@ -85,3 +87,12 @@ class TrainingConfig:
     use_torch_compile: bool = True    # torch.compile on encoder
     pin_memory: bool = True           # pin rollout buffers for faster GPU transfer
     gpu_preprocess: bool = True       # do preprocessing on GPU
+
+    # R4A1: Integrated best practices
+    use_layernorm: bool = True        # LayerNorm on encoder output (R3A3)
+    deep_heads: bool = True           # 2-layer MLP heads 512->128->out (R3A3)
+    use_cosine_lr: bool = True        # Cosine LR annealing (R3A3, better for short budgets)
+    use_lr_warmup: bool = True        # LR warmup (R3A1)
+    lr_warmup_frac: float = 0.05     # Fraction of updates for warmup
+    use_reward_normalization: bool = True   # RunningMeanStd reward normalization (R3A1)
+    use_clipped_vloss: bool = True    # Clipped value loss (R3A1)

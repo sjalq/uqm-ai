@@ -1,13 +1,11 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Round 3 Agent 2: Maximum throughput + parallelism.
-- GPU-side preprocessing (avoid CPU-GPU transfer overhead)
-- Pin memory + non_blocking transfers for rollout buffers
-- Vectorized frame stacking with pre-allocated GPU buffers
-- torch.compile on encoder for kernel fusion
-- 16 envs + 128 rollout steps for better GPU utilization
-- Reduced eval overhead (5 episodes, less frequent)
+Round 4 Agent 1: Integrated best practices from R3 losers.
+- RunningMeanStd reward normalization (R3A1)
+- Clipped value loss (R3A1)
+- LR warmup + cosine annealing (R3A1 + R3A3)
+- All R3A2 throughput preserved: GPU preprocessing, torch.compile, pin memory
 """
 
 import time
@@ -25,6 +23,37 @@ from training.config import TrainingConfig
 from uqm_env.reward import RewardShaper
 
 logger = logging.getLogger(__name__)
+
+
+class RunningMeanStd:
+    """Welford's online algorithm for running mean/variance. Used for reward normalization (R3A1)."""
+
+    def __init__(self, epsilon=1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon
+
+    def update(self, x):
+        """Update with a batch of values (numpy array or scalar)."""
+        batch = np.asarray(x).ravel()
+        batch_mean = batch.mean()
+        batch_var = batch.var()
+        batch_count = len(batch)
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
+        self.mean = new_mean
+        self.var = m2 / tot_count
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 
 def make_env(config: TrainingConfig, env_id: int = 0):
@@ -85,12 +114,15 @@ def train(config: TrainingConfig):
 
         frame_stack = getattr(config, "frame_stack", 4)
 
+        use_layernorm = getattr(config, "use_layernorm", False)
+        deep_heads = getattr(config, "deep_heads", False)
         try:
             agent = MeleeAgent(
                 encoder_type="siglip", hidden_dim=config.hidden_dim,
                 action_dim=config.action_dim, encoder_name=config.encoder_name,
                 encoder_pretrained=config.encoder_pretrained,
                 frame_stack=frame_stack,
+                use_layernorm=use_layernorm, deep_heads=deep_heads,
             ).to(device)
             logger.info("Using SigLIP encoder")
         except (ImportError, RuntimeError) as e:
@@ -98,6 +130,7 @@ def train(config: TrainingConfig):
             agent = MeleeAgent(
                 encoder_type="cnn", hidden_dim=config.hidden_dim,
                 action_dim=config.action_dim, frame_stack=frame_stack,
+                use_layernorm=use_layernorm, deep_heads=deep_heads,
             ).to(device)
 
         # R3A2: Apply torch.compile for kernel fusion speedup
@@ -127,6 +160,10 @@ def train(config: TrainingConfig):
         rewards_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
         dones_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
         values_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+
+        # R4A1: RunningMeanStd reward normalization (R3A1)
+        use_reward_norm = getattr(config, "use_reward_normalization", False)
+        reward_rms = RunningMeanStd() if use_reward_norm else None
 
         reward_shaper = RewardShaper(config.num_envs, config)
 
@@ -173,9 +210,17 @@ def train(config: TrainingConfig):
         ent_coef_start = config.ent_coef
         ent_coef_final = getattr(config, "ent_coef_final", config.ent_coef)
 
+        # R4A1: LR schedule config
+        use_cosine_lr = getattr(config, "use_cosine_lr", False)
+        use_lr_warmup = getattr(config, "use_lr_warmup", False)
+        lr_warmup_frac = getattr(config, "lr_warmup_frac", 0.05)
+        warmup_updates = int(num_updates * lr_warmup_frac) if use_lr_warmup else 0
+        use_clipped_vloss = getattr(config, "use_clipped_vloss", False)
+
         budget = getattr(config, "wall_clock_budget", 290.0)
         logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack}, num_envs: {config.num_envs})")
         logger.info(f"Entropy annealing: {ent_coef_start} -> {ent_coef_final}")
+        logger.info(f"R4A1: layernorm={use_layernorm}, deep_heads={deep_heads}, cosine_lr={use_cosine_lr}, lr_warmup={use_lr_warmup}({warmup_updates}), reward_norm={use_reward_norm}, clipped_vloss={use_clipped_vloss}")
         logger.info(f"R3A2: gpu_preprocess={use_gpu_preprocess}, pin_memory={use_pin}, torch.compile={agent._compiled}")
 
         use_amp = (device.type == "cuda")
@@ -190,12 +235,26 @@ def train(config: TrainingConfig):
                 logger.info(f"Budget reached at {elapsed:.1f}s")
                 break
 
-            frac = 1.0 - (update - 1.0) / num_updates
-            lr = frac * config.learning_rate
+            # R4A1: LR schedule with warmup + cosine/linear decay
+            progress = (update - 1.0) / max(num_updates - 1, 1)
+            if use_lr_warmup and update <= warmup_updates:
+                # Linear warmup
+                lr = config.learning_rate * (update / max(warmup_updates, 1))
+            elif use_cosine_lr:
+                # Cosine annealing after warmup (R3A3)
+                if warmup_updates > 0:
+                    cosine_progress = (update - warmup_updates) / max(num_updates - warmup_updates, 1)
+                else:
+                    cosine_progress = progress
+                lr = config.learning_rate * 0.5 * (1.0 + np.cos(np.pi * cosine_progress))
+            else:
+                # Original linear decay
+                frac = 1.0 - progress
+                lr = frac * config.learning_rate
             optimizer.param_groups[0]["lr"] = lr
 
             # Entropy annealing: linear decay from start to final
-            current_ent_coef = ent_coef_start + (ent_coef_final - ent_coef_start) * (1.0 - frac)
+            current_ent_coef = ent_coef_start + (ent_coef_final - ent_coef_start) * progress
 
             # Curriculum: expand to full action space after phase 1
             if has_curriculum and not curriculum_expanded and global_step >= config.curriculum_phase1_steps:
@@ -237,7 +296,7 @@ def train(config: TrainingConfig):
                         reward_shaper.reset_env(i, info)
                     done = terminated or truncated
                     shaped_reward = reward_shaper.shape_reward(i, raw_reward, info, done)
-                    rewards_buf[step, i] = shaped_reward
+                    rewards_buf[step, i] = float(shaped_reward)
                     next_done[i] = float(done)
                     if done:
                         try:
@@ -272,6 +331,12 @@ def train(config: TrainingConfig):
                     else:
                         next_obs_processed = next_obs_single
 
+            # R4A1: Reward normalization (R3A1)
+            if reward_rms is not None:
+                step_rewards = rewards_buf.numpy()
+                reward_rms.update(step_rewards.ravel())
+                rewards_buf = torch.tensor(reward_rms.normalize(step_rewards), dtype=torch.float32)
+
             # GAE computation
             with torch.no_grad():
                 if use_gpu_preprocess and frame_bufs is not None:
@@ -294,6 +359,7 @@ def train(config: TrainingConfig):
             b_actions = actions_buf.reshape(-1)
             b_advantages = advantages.reshape(-1)
             b_returns = returns.reshape(-1)
+            b_values = values_buf.reshape(-1)  # R4A1: needed for clipped value loss
             b_inds = np.arange(batch_size)
             clipfracs = []
 
@@ -307,6 +373,7 @@ def train(config: TrainingConfig):
                     mb_lp = b_logprobs[mb].to(device, non_blocking=use_pin)
                     mb_adv = b_advantages[mb].to(device, non_blocking=use_pin)
                     mb_ret = b_returns[mb].to(device, non_blocking=use_pin)
+                    mb_val = b_values[mb].to(device, non_blocking=use_pin)
                     try:
                         with torch.amp.autocast("cuda", enabled=use_amp):
                             _, nlp, ent, nv = agent.get_action_and_value(mb_obs, mb_act)
@@ -317,7 +384,14 @@ def train(config: TrainingConfig):
                             pg1 = -adv * ratio
                             pg2 = -adv * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
                             pg_loss = torch.max(pg1, pg2).mean()
-                            v_loss = 0.5 * ((nv - mb_ret) ** 2).mean()
+                            # R4A1: Clipped value loss (R3A1) - prevents large value function updates
+                            if use_clipped_vloss:
+                                v_clipped = mb_val + torch.clamp(nv - mb_val, -config.clip_coef, config.clip_coef)
+                                v_loss_unclipped = (nv - mb_ret) ** 2
+                                v_loss_clipped = (v_clipped - mb_ret) ** 2
+                                v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                            else:
+                                v_loss = 0.5 * ((nv - mb_ret) ** 2).mean()
                             entropy_loss = ent.mean()
                             loss = pg_loss - current_ent_coef * entropy_loss + config.vf_coef * v_loss
                         optimizer.zero_grad()
