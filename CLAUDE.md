@@ -53,9 +53,29 @@ You are in an evolutionary competition. Your goal: modify code so the AI reaches
 - Bit 3: WEAPON (fire)
 - Bit 4: SPECIAL
 
-### Metric
+### Training Budget
 
-TIME-TO-COMPETENCY: wall-clock seconds until 80% win rate vs Cyborg over rolling window of 3 evaluations.
+Each agent gets exactly 5 MINUTES of training time. Not more. The hard wall-clock limit is 300 seconds. When time is up, training stops and the best checkpoint so far is evaluated.
+
+### Scoring (composite, not just win rate)
+
+The PRIMARY goal is win rate against Cyborg. But in early rounds, nobody may win a single game. So scoring uses a composite metric that the team lead evaluates:
+
+```
+SCORE = (win_rate * 100)                         # 0-100 points, primary
+      + (avg_survival_frames / 1000)             # longer survival = better
+      + (avg_damage_dealt / max_enemy_crew) * 10 # dealing damage = progress
+      - (avg_damage_taken / max_own_crew) * 5    # taking less damage = better
+      + (games_where_damage_dealt > 0) * 0.5     # even landing one hit counts
+```
+
+The team lead MAY adjust scoring weights between rounds if the current scoring isn't differentiating agents well enough. For example:
+- If all agents die instantly, weight survival time heavily
+- If agents survive but never fire, weight damage dealt
+- If agents do damage but never win, weight win rate more
+- The lead should explain any scoring adjustments in the commit message
+
+This adaptive scoring ensures early rounds aren't just "everyone scored 0, pick randomly".
 
 ## Development
 

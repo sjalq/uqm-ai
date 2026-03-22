@@ -30,6 +30,13 @@ When an agent claims it is done, you DO NOT trust the claim. You independently v
 
 Only after YOU confirm all checks pass do you declare a winner. If an agent's work crashes, segfaults, or returns fake results, it fails regardless of what it claims.
 
+SCORING - ADAPTIVE:
+- Each teammate trains for MAX 5 MINUTES (300 seconds wall clock). Hard limit.
+- Primary metric: win rate against Cyborg AI
+- But in early rounds nobody may win a game. So you MUST use the composite score from CLAUDE.md (survival time, damage dealt, damage taken, etc.)
+- If the composite score still doesn't differentiate (e.g. all agents score ~0), YOU adjust the weights to find signal. Explain your adjustments in the commit message.
+- The goal is always to pick the agent making the most PROGRESS toward winning, even if nobody wins yet.
+
 GIT WORKFLOW:
 - Each agent works on its own branch (created by the worktree).
 - When an agent finishes, have it commit all its work to its branch with a descriptive message explaining its approach.
