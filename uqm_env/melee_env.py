@@ -1,16 +1,20 @@
 """
 Gymnasium environment for UQM Super Melee.
 
-Round 6 Agent 2: Subprocess-isolated environment wrapper.
-The game runs in a child process so segfaults in libmelee.so
-don't kill the training loop. Includes timeouts, auto-restart,
-and episode statistics tracking.
+Round 9 Agent 2: Shared memory optimization for subprocess communication.
+The 240x320x3 pixel observation (~230KB) is written to shared memory by the
+worker process. Only small control dicts (crew, energy, done, winner) are
+sent over the pipe. This eliminates pickle serialization of the observation,
+which was the main throughput bottleneck (~5 SPS).
+
+The worker subprocess is persistent across episodes (no respawning).
 """
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import multiprocessing as mp
+from multiprocessing import shared_memory
 import logging
 import time
 import os
@@ -24,17 +28,32 @@ RESET_TIMEOUT = 60.0  # First reset loads UQM content (~20-30s)
 # Max consecutive failures before giving up
 MAX_CONSECUTIVE_FAILURES = 5
 
+# Observation dimensions
+OBS_H, OBS_W, OBS_C = 240, 320, 3
+OBS_BYTES = OBS_H * OBS_W * OBS_C  # 230400 bytes
 
-def _worker_loop(pipe, ship_p1, ship_p2, p2_cyborg, frame_skip, headless, seed):
+
+def _worker_loop(pipe, shm_name, ship_p1, ship_p2, p2_cyborg, frame_skip, headless, seed):
     """
     Game worker process. Runs libmelee.so in isolation.
-    Communicates via a multiprocessing Pipe.
-    If this process segfaults, the parent can detect the broken pipe and restart.
+    Writes pixel observations directly to shared memory.
+    Sends only small control dicts over the pipe.
     """
-    # Import inside the subprocess to get a fresh library load
     from uqm_env import melee_ffi
 
     active = False
+    # Attach to the shared memory block created by the parent
+    shm = None
+    shm_array = None
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name, create=False)
+        shm_array = np.ndarray((OBS_H, OBS_W, OBS_C), dtype=np.uint8, buffer=shm.buf)
+    except Exception as e:
+        try:
+            pipe.send(("error", f"Failed to attach shared memory: {e}"))
+        except Exception:
+            pass
+        return
 
     try:
         while True:
@@ -66,7 +85,22 @@ def _worker_loop(pipe, ship_p1, ship_p2, p2_cyborg, frame_skip, headless, seed):
 
                     # Step one frame to get initial observation
                     result = melee_ffi.step(0, 0)
-                    pipe.send(("ok", result))
+                    # Write pixels to shared memory (zero-copy into buffer)
+                    pixels = result["pixels"]
+                    if pixels.shape == (OBS_H, OBS_W, OBS_C):
+                        shm_array[:] = pixels
+                    else:
+                        shm_array[:] = 0
+                    # Send only metadata over pipe (no pixels)
+                    pipe.send(("ok", {
+                        "p1_crew": result["p1_crew"],
+                        "p2_crew": result["p2_crew"],
+                        "p1_max_crew": result.get("p1_max_crew", 0),
+                        "p2_max_crew": result.get("p2_max_crew", 0),
+                        "p1_energy": result.get("p1_energy", 0),
+                        "p2_energy": result.get("p2_energy", 0),
+                        "frame_count": result["frame_count"],
+                    }))
                 except Exception as e:
                     pipe.send(("error", str(e)))
 
@@ -89,7 +123,25 @@ def _worker_loop(pipe, ship_p1, ship_p2, p2_cyborg, frame_skip, headless, seed):
                                 total_reward -= 1.0
                             break
 
-                    pipe.send(("ok", result, total_reward, terminated))
+                    # Write pixels to shared memory
+                    pixels = result["pixels"]
+                    if pixels.shape == (OBS_H, OBS_W, OBS_C):
+                        shm_array[:] = pixels
+                    else:
+                        shm_array[:] = 0
+
+                    # Send only metadata + reward over pipe
+                    pipe.send(("ok", {
+                        "p1_crew": result["p1_crew"],
+                        "p2_crew": result["p2_crew"],
+                        "p1_max_crew": result.get("p1_max_crew", 0),
+                        "p2_max_crew": result.get("p2_max_crew", 0),
+                        "p1_energy": result.get("p1_energy", 0),
+                        "p2_energy": result.get("p2_energy", 0),
+                        "winner": result.get("winner", -1),
+                        "frame_count": result["frame_count"],
+                        "done": result["done"],
+                    }, total_reward, terminated))
                 except Exception as e:
                     pipe.send(("error", str(e)))
 
@@ -115,6 +167,11 @@ def _worker_loop(pipe, ship_p1, ship_p2, p2_cyborg, frame_skip, headless, seed):
         except Exception:
             pass
         try:
+            if shm is not None:
+                shm.close()  # Close but don't unlink (parent owns it)
+        except Exception:
+            pass
+        try:
             pipe.close()
         except Exception:
             pass
@@ -122,11 +179,12 @@ def _worker_loop(pipe, ship_p1, ship_p2, p2_cyborg, frame_skip, headless, seed):
 
 class MeleeEnv(gym.Env):
     """
-    UQM Super Melee environment with subprocess isolation.
+    UQM Super Melee environment with subprocess isolation and shared memory.
 
     The game runs in a child process (multiprocessing spawn) so that
     segfaults in libmelee.so don't crash the training loop.
-    Includes timeouts on all operations and automatic restart on failure.
+    Pixel observations are transferred via shared memory (zero-copy).
+    Only small control messages go through the pipe.
 
     Observation: RGB screenshot (240, 320, 3) uint8
     Action: Discrete(32) - 5-bit mask of (left, right, thrust, weapon, special)
@@ -152,7 +210,7 @@ class MeleeEnv(gym.Env):
 
         # RGB screenshot
         self.observation_space = spaces.Box(
-            low=0, high=255, shape=(240, 320, 3), dtype=np.uint8
+            low=0, high=255, shape=(OBS_H, OBS_W, OBS_C), dtype=np.uint8
         )
 
         self._last_obs = None
@@ -161,6 +219,8 @@ class MeleeEnv(gym.Env):
         # Subprocess state
         self._process = None
         self._pipe = None
+        self._shm = None
+        self._shm_array = None
         self._consecutive_failures = 0
 
         # Episode statistics
@@ -174,16 +234,50 @@ class MeleeEnv(gym.Env):
         self._total_episodes = 0
         self._total_crashes = 0
 
+    def _create_shared_memory(self):
+        """Create a shared memory block for pixel observations."""
+        if self._shm is not None:
+            return  # Already created
+        try:
+            self._shm = shared_memory.SharedMemory(
+                create=True, size=OBS_BYTES
+            )
+            self._shm_array = np.ndarray(
+                (OBS_H, OBS_W, OBS_C), dtype=np.uint8, buffer=self._shm.buf
+            )
+            self._shm_array[:] = 0
+            logger.debug(f"Shared memory created: {self._shm.name} ({OBS_BYTES} bytes)")
+        except Exception as e:
+            logger.error(f"Failed to create shared memory: {e}")
+            self._shm = None
+            self._shm_array = None
+            raise
+
+    def _destroy_shared_memory(self):
+        """Clean up shared memory."""
+        if self._shm is not None:
+            try:
+                self._shm.close()
+                self._shm.unlink()
+            except Exception:
+                pass
+            self._shm = None
+            self._shm_array = None
+
     def _start_worker(self):
         """Start (or restart) the game worker subprocess."""
         self._kill_worker()
         try:
+            # Ensure shared memory exists
+            self._create_shared_memory()
+
             ctx = mp.get_context("spawn")
             parent_pipe, child_pipe = ctx.Pipe()
             self._pipe = parent_pipe
             self._process = ctx.Process(
                 target=_worker_loop,
-                args=(child_pipe, self.ship_p1, self.ship_p2,
+                args=(child_pipe, self._shm.name,
+                      self.ship_p1, self.ship_p2,
                       self.p2_cyborg, self.frame_skip, self.headless, self._seed),
                 daemon=True,
             )
@@ -235,6 +329,12 @@ class MeleeEnv(gym.Env):
         except (EOFError, BrokenPipeError, OSError) as e:
             raise OSError(f"Worker died during {cmd[0]}: {e}") from e
 
+    def _read_obs_from_shm(self):
+        """Read observation from shared memory (copy to avoid races)."""
+        if self._shm_array is not None:
+            return self._shm_array.copy()
+        return np.zeros((OBS_H, OBS_W, OBS_C), dtype=np.uint8)
+
     def _ensure_worker(self):
         """Make sure a worker process is running."""
         if self._process is None or not self._process.is_alive():
@@ -251,7 +351,8 @@ class MeleeEnv(gym.Env):
 
                 if response[0] == "ok":
                     result = response[1]
-                    self._last_obs = result["pixels"]
+                    # Read pixels from shared memory instead of pipe
+                    self._last_obs = self._read_obs_from_shm()
                     self._episode_reward = 0.0
                     self._episode_frames = 0
                     self._initial_p1_crew = result.get("p1_crew", 0)
@@ -279,7 +380,7 @@ class MeleeEnv(gym.Env):
         # All attempts failed - return a blank observation
         self._consecutive_failures += 1
         logger.error(f"All {MAX_CONSECUTIVE_FAILURES} reset attempts failed, returning blank obs")
-        self._last_obs = np.zeros((240, 320, 3), dtype=np.uint8)
+        self._last_obs = np.zeros((OBS_H, OBS_W, OBS_C), dtype=np.uint8)
         return self._last_obs, {"frame_count": 0, "p1_crew": 0, "p2_crew": 0}
 
     def step(self, action):
@@ -298,7 +399,8 @@ class MeleeEnv(gym.Env):
                 total_reward = response[2]
                 terminated = response[3]
 
-                self._last_obs = result["pixels"]
+                # Read pixels from shared memory instead of pipe
+                self._last_obs = self._read_obs_from_shm()
                 self._episode_reward += total_reward
                 self._episode_frames += 1
 
@@ -337,7 +439,7 @@ class MeleeEnv(gym.Env):
 
             # Return a "done" signal so the training loop resets this env
             if self._last_obs is None:
-                self._last_obs = np.zeros((240, 320, 3), dtype=np.uint8)
+                self._last_obs = np.zeros((OBS_H, OBS_W, OBS_C), dtype=np.uint8)
             return self._last_obs, 0.0, True, False, {
                 "p1_crew": 0,
                 "p2_crew": 0,
@@ -359,6 +461,7 @@ class MeleeEnv(gym.Env):
             except Exception:
                 pass
         self._kill_worker()
+        self._destroy_shared_memory()
 
     def get_stats(self):
         """Return cumulative environment statistics."""
