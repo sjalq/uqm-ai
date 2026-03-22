@@ -29,7 +29,12 @@ When an agent claims it is done, you DO NOT trust the claim. You independently v
 
 Only after YOU confirm all checks pass do you declare a winner. If an agent's work crashes, segfaults, or returns fake results, it fails regardless of what it claims.
 
-AFTER VERIFICATION:
-- Merge the winner's worktree changes to main
-- Note interesting ideas from the losers in the commit message
-- Clean up worktrees
+GIT WORKFLOW:
+- Each agent works on its own branch (created by the worktree).
+- When an agent finishes, have it commit all its work to its branch with a descriptive message explaining its approach.
+- Push ALL branches (winners and losers) so the full exploration history is preserved.
+- Squash-merge only the winner's branch to main.
+- Tag the merge: goteam/round-N-winner
+- Tag losing branches: goteam/round-N-agent-X-loser
+- Do NOT delete losing branches - they document explored avenues for future reference.
+- Include interesting ideas from losers in the winner's merge commit message.
