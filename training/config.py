@@ -36,7 +36,7 @@ class TrainingConfig:
     ship_p2: int = 5
     p2_cyborg: bool = True
     frame_skip: int = 4
-    num_envs: int = 16              # R3A2: doubled from 8 for more diverse experience
+    num_envs: int = 1               # R8A1: single env, maximize steps per update
 
     encoder_name: str = "ViT-B-16-SigLIP"
     encoder_pretrained: str = "webli"
@@ -47,14 +47,14 @@ class TrainingConfig:
     # Frame stacking: number of consecutive grayscale frames as CNN input
     frame_stack: int = 4
 
-    learning_rate: float = 7e-4
-    num_steps: int = 128             # R3A2: doubled from 64 for larger rollouts, fewer updates
-    num_minibatches: int = 8         # R3A2: scaled with num_envs to keep minibatch_size constant
-    update_epochs: int = 3
+    learning_rate: float = 3e-3      # R8A1: higher LR for fast learning with few steps
+    num_steps: int = 16              # R8A1: short rollouts, frequent updates
+    num_minibatches: int = 2         # R8A1: 2 minibatches of 8 steps each
+    update_epochs: int = 4           # R8A1: more epochs per update to squeeze value from each rollout
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.05
+    ent_coef: float = 0.1            # R8A1: higher exploration with so few steps
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
