@@ -1,8 +1,8 @@
 """
 Training configuration - all hyperparameters in one place.
 
-Round 2 Agent 3: Frame stacking + tuned hyperparameters.
-Builds on Round 1 lightweight CNN with 4-frame temporal awareness.
+Round 3 Agent 2: Maximum throughput + parallelism.
+More envs, GPU preprocessing, torch.compile, optimized rollout loop.
 """
 
 from dataclasses import dataclass, field
@@ -34,7 +34,7 @@ class TrainingConfig:
     ship_p2: int = 5
     p2_cyborg: bool = True
     frame_skip: int = 4
-    num_envs: int = 8
+    num_envs: int = 16              # R3A2: doubled from 8 for more diverse experience
 
     encoder_name: str = "ViT-B-16-SigLIP"
     encoder_pretrained: str = "webli"
@@ -46,13 +46,13 @@ class TrainingConfig:
     frame_stack: int = 4
 
     learning_rate: float = 7e-4
-    num_steps: int = 64               # Shorter rollouts = more frequent updates
-    num_minibatches: int = 4
-    update_epochs: int = 3            # Fewer epochs per update = faster wall-clock
+    num_steps: int = 128             # R3A2: doubled from 64 for larger rollouts, fewer updates
+    num_minibatches: int = 8         # R3A2: scaled with num_envs to keep minibatch_size constant
+    update_epochs: int = 3
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.05            # Starting entropy (will anneal)
+    ent_coef: float = 0.05
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -65,9 +65,9 @@ class TrainingConfig:
 
     total_timesteps: int = 1_000_000
     wall_clock_budget: float = 290.0
-    eval_interval: int = 20_000
-    eval_episodes: int = 10
-    checkpoint_interval: int = 50_000
+    eval_interval: int = 40_000      # R3A2: less frequent eval (was 20k)
+    eval_episodes: int = 5           # R3A2: fewer eval episodes (was 10)
+    checkpoint_interval: int = 80_000  # R3A2: less frequent checkpoints
 
     target_win_rate: float = 0.8
 
@@ -80,3 +80,8 @@ class TrainingConfig:
     reward_damage_taken_scale: float = 1.0
     reward_combo_bonus: float = 0.05
     reward_survival_bonus: float = 0.0005
+
+    # R3A2: Throughput optimizations
+    use_torch_compile: bool = True    # torch.compile on encoder
+    pin_memory: bool = True           # pin rollout buffers for faster GPU transfer
+    gpu_preprocess: bool = True       # do preprocessing on GPU

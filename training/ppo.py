@@ -1,8 +1,13 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Round 2 combined: Dense reward shaping (Agent 1), curriculum learning + action masking +
-entropy annealing (Agent 2), frame stacking (Agent 3).
+Round 3 Agent 2: Maximum throughput + parallelism.
+- GPU-side preprocessing (avoid CPU-GPU transfer overhead)
+- Pin memory + non_blocking transfers for rollout buffers
+- Vectorized frame stacking with pre-allocated GPU buffers
+- torch.compile on encoder for kernel fusion
+- 16 envs + 128 rollout steps for better GPU utilization
+- Reduced eval overhead (5 episodes, less frequent)
 """
 
 import time
@@ -15,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from training.agent import MeleeAgent, preprocess_obs
+from training.agent import MeleeAgent, preprocess_obs, preprocess_obs_gpu
 from training.config import TrainingConfig
 from uqm_env.reward import RewardShaper
 
@@ -95,6 +100,12 @@ def train(config: TrainingConfig):
                 action_dim=config.action_dim, frame_stack=frame_stack,
             ).to(device)
 
+        # R3A2: Apply torch.compile for kernel fusion speedup
+        if getattr(config, "use_torch_compile", True):
+            agent.try_compile()
+            if agent._compiled:
+                logger.info("torch.compile applied to encoder")
+
         trainable_params = [p for p in agent.parameters() if p.requires_grad]
         logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
         optimizer = optim.Adam(trainable_params, lr=config.learning_rate, eps=1e-5)
@@ -108,20 +119,25 @@ def train(config: TrainingConfig):
         else:
             obs_channels = frame_stack
 
-        obs_buf = torch.zeros((config.num_steps, config.num_envs, obs_channels, input_size, input_size), dtype=torch.float32)
-        actions_buf = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long)
-        logprobs_buf = torch.zeros((config.num_steps, config.num_envs))
-        rewards_buf = torch.zeros((config.num_steps, config.num_envs))
-        dones_buf = torch.zeros((config.num_steps, config.num_envs))
-        values_buf = torch.zeros((config.num_steps, config.num_envs))
+        # R3A2: Pin memory for fast async GPU transfer
+        use_pin = getattr(config, "pin_memory", True) and device.type == "cuda"
+        obs_buf = torch.zeros((config.num_steps, config.num_envs, obs_channels, input_size, input_size), dtype=torch.float32, pin_memory=use_pin)
+        actions_buf = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long, pin_memory=use_pin)
+        logprobs_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+        rewards_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+        dones_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+        values_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
 
         reward_shaper = RewardShaper(config.num_envs, config)
 
-        # Frame stacking: maintain per-env frame buffers for CNN path
-        # Each buffer is (frame_stack, H, W) on CPU
+        # R3A2: GPU-side frame stacking buffer
+        use_gpu_preprocess = getattr(config, "gpu_preprocess", True) and device.type == "cuda"
         frame_bufs = None
         if frame_stack > 1 and agent.encoder_type != "siglip":
-            frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32)
+            if use_gpu_preprocess:
+                frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32, device=device)
+            else:
+                frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32)
 
         next_obs_list = []
         next_done = torch.zeros(config.num_envs)
@@ -129,17 +145,24 @@ def train(config: TrainingConfig):
             obs, info = env.reset()
             next_obs_list.append(obs)
             reward_shaper.reset_env(i, info)
-        # Preprocess to single-channel grayscale
-        next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
-        # Initialize frame buffers by repeating first frame
-        if frame_bufs is not None:
+
+        # Initial preprocessing
+        if use_gpu_preprocess and frame_bufs is not None:
+            raw_obs_tensor = torch.from_numpy(np.array(next_obs_list)).to(device, non_blocking=True)
+            next_obs_single = preprocess_obs_gpu(raw_obs_tensor, target_size=input_size)
             for i in range(config.num_envs):
                 frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
             next_obs_processed = frame_bufs.clone()
         else:
-            next_obs_processed = next_obs_single
+            next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+            if frame_bufs is not None:
+                for i in range(config.num_envs):
+                    frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
+                next_obs_processed = frame_bufs.clone()
+            else:
+                next_obs_processed = next_obs_single
 
-        # Curriculum learning: start with restricted combat actions, expand later
+        # Curriculum learning
         has_curriculum = hasattr(config, "curriculum_phase1_steps") and hasattr(config, "combat_actions")
         if has_curriculum:
             agent.set_action_mask(config.combat_actions)
@@ -151,11 +174,15 @@ def train(config: TrainingConfig):
         ent_coef_final = getattr(config, "ent_coef_final", config.ent_coef)
 
         budget = getattr(config, "wall_clock_budget", 290.0)
-        logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack})")
+        logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack}, num_envs: {config.num_envs})")
         logger.info(f"Entropy annealing: {ent_coef_start} -> {ent_coef_final}")
+        logger.info(f"R3A2: gpu_preprocess={use_gpu_preprocess}, pin_memory={use_pin}, torch.compile={agent._compiled}")
 
         use_amp = (device.type == "cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+        # R3A2: Pre-allocate numpy array for raw observations
+        raw_obs_np = np.zeros((config.num_envs,) + next_obs_list[0].shape, dtype=next_obs_list[0].dtype)
 
         for update in range(1, num_updates + 1):
             elapsed = time.time() - start_time
@@ -178,19 +205,28 @@ def train(config: TrainingConfig):
 
             for step in range(config.num_steps):
                 global_step += config.num_envs
-                obs_buf[step] = next_obs_processed
+
+                if use_gpu_preprocess and frame_bufs is not None:
+                    obs_buf[step] = next_obs_processed.cpu()
+                else:
+                    obs_buf[step] = next_obs_processed
                 dones_buf[step] = next_done
 
                 with torch.no_grad():
-                    action, logprob, _, value = agent.get_action_and_value(next_obs_processed.to(device))
+                    if use_gpu_preprocess and frame_bufs is not None:
+                        obs_gpu = next_obs_processed
+                    else:
+                        obs_gpu = next_obs_processed.to(device, non_blocking=use_pin)
+                    action, logprob, _, value = agent.get_action_and_value(obs_gpu)
                     values_buf[step] = value.cpu()
                 actions_buf[step] = action.cpu()
                 logprobs_buf[step] = logprob.cpu()
 
-                next_obs_list = []
+                # R3A2: Collect actions once, step all envs with pre-allocated buffer
+                actions_np = action.cpu().numpy()
                 for i, env in enumerate(envs):
                     try:
-                        obs, raw_reward, terminated, truncated, info = env.step(action[i].item())
+                        obs, raw_reward, terminated, truncated, info = env.step(int(actions_np[i]))
                     except Exception:
                         try:
                             obs, info = env.reset()
@@ -210,23 +246,38 @@ def train(config: TrainingConfig):
                             envs[i] = make_env(config, i)
                             obs, info = envs[i].reset()
                         reward_shaper.reset_env(i, info)
-                    next_obs_list.append(obs)
+                    raw_obs_np[i] = obs
 
-                next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
-                if frame_bufs is not None:
+                # R3A2: GPU-side preprocessing for frame stacking
+                if use_gpu_preprocess and frame_bufs is not None:
+                    raw_obs_tensor = torch.from_numpy(raw_obs_np).to(device, non_blocking=True)
+                    next_obs_single = preprocess_obs_gpu(raw_obs_tensor, target_size=input_size)
                     for i in range(config.num_envs):
                         if next_done[i]:
-                            # Reset frame buffer on episode end
                             frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
                         else:
-                            # Shift left (drop oldest), append new frame
-                            frame_bufs[i] = torch.cat([frame_bufs[i, 1:], next_obs_single[i, 0:1]], dim=0)
+                            # Roll + overwrite last slot - faster than cat
+                            frame_bufs[i] = frame_bufs[i].roll(-1, dims=0)
+                            frame_bufs[i, -1] = next_obs_single[i, 0]
                     next_obs_processed = frame_bufs.clone()
                 else:
-                    next_obs_processed = next_obs_single
+                    next_obs_single = preprocess_obs(raw_obs_np, target_size=input_size, device="cpu")
+                    if frame_bufs is not None:
+                        for i in range(config.num_envs):
+                            if next_done[i]:
+                                frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
+                            else:
+                                frame_bufs[i] = torch.cat([frame_bufs[i, 1:], next_obs_single[i, 0:1]], dim=0)
+                        next_obs_processed = frame_bufs.clone()
+                    else:
+                        next_obs_processed = next_obs_single
 
+            # GAE computation
             with torch.no_grad():
-                next_value = agent.get_value(next_obs_processed.to(device)).squeeze(-1).cpu()
+                if use_gpu_preprocess and frame_bufs is not None:
+                    next_value = agent.get_value(next_obs_processed).squeeze(-1).cpu()
+                else:
+                    next_value = agent.get_value(next_obs_processed.to(device, non_blocking=use_pin)).squeeze(-1).cpu()
                 advantages = torch.zeros_like(rewards_buf)
                 lastgaelam = 0
                 for t in reversed(range(config.num_steps)):
@@ -250,11 +301,12 @@ def train(config: TrainingConfig):
                 np.random.shuffle(b_inds)
                 for start in range(0, batch_size, minibatch_size):
                     mb = b_inds[start:start + minibatch_size]
-                    mb_obs = b_obs[mb].to(device)
-                    mb_act = b_actions[mb].to(device)
-                    mb_lp = b_logprobs[mb].to(device)
-                    mb_adv = b_advantages[mb].to(device)
-                    mb_ret = b_returns[mb].to(device)
+                    # R3A2: non_blocking transfer for pinned memory
+                    mb_obs = b_obs[mb].to(device, non_blocking=use_pin)
+                    mb_act = b_actions[mb].to(device, non_blocking=use_pin)
+                    mb_lp = b_logprobs[mb].to(device, non_blocking=use_pin)
+                    mb_adv = b_advantages[mb].to(device, non_blocking=use_pin)
+                    mb_ret = b_returns[mb].to(device, non_blocking=use_pin)
                     try:
                         with torch.amp.autocast("cuda", enabled=use_amp):
                             _, nlp, ent, nv = agent.get_action_and_value(mb_obs, mb_act)
@@ -327,7 +379,6 @@ def train(config: TrainingConfig):
     finally:
         results = _save_results(config, global_step, start_time, best_win_rate, competency_reached_at, training_log, best_eval_metrics)
         if agent is not None:
-            # Clear action mask for clean eval-ready checkpoint
             agent.set_action_mask(None)
             try:
                 torch.save(agent.state_dict(), os.path.join(config.checkpoint_dir, "final.pt"))
@@ -353,13 +404,11 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
         return 0.0, {}
 
     wins = surv = dmg_d = dmg_t = g_dmg = 0
-    # Save and clear action mask for evaluation (use all actions)
     saved_mask = agent._action_mask
     agent.set_action_mask(None)
     agent.eval()
     try:
         for ep in range(config.eval_episodes):
-            # Reset frame buffer for clean eval episodes
             if hasattr(agent, "reset_frame_buffer"):
                 agent.reset_frame_buffer()
             try:
@@ -393,7 +442,6 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
                 wins += 1
     finally:
         agent.train()
-        # Restore action mask for training
         agent._action_mask = saved_mask
         try:
             env.close()

@@ -1,11 +1,10 @@
 """
 Agent network: lightweight grayscale CNN encoder + trainable actor-critic MLP heads.
 
-Round 2 Agent 3: Frame stacking (4 frames) for temporal awareness.
-- 4-channel input (4 stacked grayscale frames) captures velocity/direction
-- Internal frame buffer for seamless eval compatibility
-- Nature DQN CNN with orthogonal init
-- Action masking preserved from Agent 2 for curriculum learning
+Round 3 Agent 2: Throughput optimizations.
+- GPU-side preprocessing function (preprocess_obs_gpu)
+- torch.compile support via try_compile()
+- All prior features preserved: frame stacking, action masking, orthogonal init
 """
 
 import torch
@@ -66,6 +65,20 @@ class SimpleCNNEncoder(nn.Module):
         x = F.relu(self.conv3(x))
         x = x.reshape(x.size(0), -1)
         return F.relu(self.fc(x))
+
+
+def preprocess_obs_gpu(obs_tensor, target_size=84):
+    """
+    GPU-side preprocessing: grayscale conversion + resize.
+    Input: (B, H, W, 3) uint8 tensor on GPU
+    Output: (B, 1, target_size, target_size) float32 tensor on GPU
+    """
+    obs_float = obs_tensor.float()
+    gray = (0.2989 * obs_float[:, :, :, 0] + 0.5870 * obs_float[:, :, :, 1] + 0.1140 * obs_float[:, :, :, 2])
+    gray = gray.unsqueeze(1) / 255.0
+    if gray.shape[2] != target_size or gray.shape[3] != target_size:
+        gray = F.interpolate(gray, size=(target_size, target_size), mode="bilinear", align_corners=False)
+    return gray
 
 
 def preprocess_obs(obs, target_size=84, device="cpu"):
@@ -135,6 +148,18 @@ class MeleeAgent(nn.Module):
         self._frame_buffer = None
         # Action mask: None means all actions allowed
         self._action_mask = None
+        # Flag for whether torch.compile has been applied
+        self._compiled = False
+
+    def try_compile(self):
+        """Apply torch.compile to encoder for kernel fusion speedup. Safe no-op on failure."""
+        if self._compiled:
+            return
+        try:
+            self.encoder = torch.compile(self.encoder, mode="reduce-overhead")
+            self._compiled = True
+        except Exception:
+            pass
 
     def reset_frame_buffer(self):
         """Clear frame buffer. Call on episode reset."""
@@ -147,10 +172,8 @@ class MeleeAgent(nn.Module):
         Returns: (B, frame_stack, H, W) stacked frames
         """
         if self._frame_buffer is None or self._frame_buffer.shape[0] != single_frame.shape[0]:
-            # Initialize: repeat the first frame across all stack slots
             self._frame_buffer = single_frame.repeat(1, self.frame_stack, 1, 1)
         else:
-            # Shift left (drop oldest) and append new frame
             self._frame_buffer = torch.cat([
                 self._frame_buffer[:, 1:, :, :],
                 single_frame
