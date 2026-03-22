@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SESSION="uqm-team"
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # Preflight
 command -v tmux >/dev/null || { echo "Error: tmux not installed. Run: sudo pacman -S tmux"; exit 1; }
@@ -30,7 +30,10 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # Start tmux session running claude in the repo root
-tmux new-session -d -s "$SESSION" -c "$REPO_ROOT" "claude ${CLAUDE_ARGS[*]}; bash"
+# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS must be set for TeamCreate to work
+tmux new-session -d -s "$SESSION" -c "$REPO_ROOT" \
+    -e "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1" \
+    "claude ${CLAUDE_ARGS[*]}; bash"
 
 # Styling: distinct pane borders and colors
 # Active pane gets a bright border, inactive panes get dim borders
