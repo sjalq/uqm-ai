@@ -1,13 +1,10 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Round 3 Agent 3: Architecture improvements + value learning + exploration.
-- Deeper MLP heads with LayerNorm (Agent 3)
-- Cosine LR annealing with warmup (Agent 3)
-- Clipped value loss for stable value function updates (Agent 1)
-- Running mean/std reward normalization (Agent 1)
-- Hash-based exploration bonus for state coverage (Agent 1)
-- Batch-level advantage normalization (Agent 1)
+Round 3 combined: All three agents' improvements merged.
+- Agent 1: Clipped value loss, reward normalization, exploration bonus, batch adv norm
+- Agent 2: GPU preprocessing, pin memory, torch.compile, 16 envs, 128 rollout steps
+- Agent 3: Deeper MLP heads with LayerNorm, cosine LR annealing
 """
 
 import time
@@ -21,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from training.agent import MeleeAgent, preprocess_obs
+from training.agent import MeleeAgent, preprocess_obs, preprocess_obs_gpu
 from training.config import TrainingConfig
 from uqm_env.reward import RewardShaper
 
@@ -37,7 +34,6 @@ class RunningMeanStd:
         self.count = epsilon
 
     def update(self, x):
-        """Update with a batch of values (numpy array or scalar)."""
         batch = np.asarray(x).ravel()
         batch_mean = batch.mean()
         batch_var = batch.var()
@@ -68,13 +64,9 @@ class ExplorationBonus:
         self.counts = np.zeros(num_buckets, dtype=np.float64)
 
     def _hash_obs(self, obs_tensor):
-        """Hash observation to a bucket. obs_tensor: (C, H, W) float."""
-        # Downsample to 8x8 and discretize for fast hashing
         flat = obs_tensor.reshape(-1)
-        # Use a subset of pixels for speed
         stride = max(1, len(flat) // 64)
         key_pixels = flat[::stride]
-        # Simple hash: discretize to 16 levels, compute polynomial hash
         discretized = (key_pixels * 15).int().numpy().astype(np.int64)
         h = 0
         for v in discretized:
@@ -82,16 +74,10 @@ class ExplorationBonus:
         return int(h)
 
     def get_bonus(self, obs_batch):
-        """
-        Compute exploration bonus for a batch of observations.
-        obs_batch: (B, C, H, W) tensor on CPU.
-        Returns: numpy array of bonuses (B,)
-        """
         bonuses = np.zeros(obs_batch.shape[0])
         for i in range(obs_batch.shape[0]):
             h = self._hash_obs(obs_batch[i])
             self.counts[h] += 1.0
-            # Bonus proportional to 1/sqrt(count) - decreases with visits
             bonuses[i] = self.coef / np.sqrt(self.counts[h])
         return bonuses
 
@@ -162,12 +148,18 @@ def train(config: TrainingConfig):
                 frame_stack=frame_stack,
             ).to(device)
             logger.info("Using SigLIP encoder")
-        except (ImportError, RuntimeError, AttributeError) as e:
+        except (ImportError, RuntimeError) as e:
             logger.info(f"SigLIP unavailable ({e}), using CNN encoder")
             agent = MeleeAgent(
                 encoder_type="cnn", hidden_dim=config.hidden_dim,
                 action_dim=config.action_dim, frame_stack=frame_stack,
             ).to(device)
+
+        # R3A2: Apply torch.compile for kernel fusion speedup
+        if getattr(config, "use_torch_compile", True):
+            agent.try_compile()
+            if agent._compiled:
+                logger.info("torch.compile applied to encoder")
 
         trainable_params = [p for p in agent.parameters() if p.requires_grad]
         logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
@@ -182,16 +174,18 @@ def train(config: TrainingConfig):
         else:
             obs_channels = frame_stack
 
-        obs_buf = torch.zeros((config.num_steps, config.num_envs, obs_channels, input_size, input_size), dtype=torch.float32)
-        actions_buf = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long)
-        logprobs_buf = torch.zeros((config.num_steps, config.num_envs))
-        rewards_buf = torch.zeros((config.num_steps, config.num_envs))
-        dones_buf = torch.zeros((config.num_steps, config.num_envs))
-        values_buf = torch.zeros((config.num_steps, config.num_envs))
+        # R3A2: Pin memory for fast async GPU transfer
+        use_pin = getattr(config, "pin_memory", True) and device.type == "cuda"
+        obs_buf = torch.zeros((config.num_steps, config.num_envs, obs_channels, input_size, input_size), dtype=torch.float32, pin_memory=use_pin)
+        actions_buf = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long, pin_memory=use_pin)
+        logprobs_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+        rewards_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+        dones_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
+        values_buf = torch.zeros((config.num_steps, config.num_envs), pin_memory=use_pin)
 
         reward_shaper = RewardShaper(config.num_envs, config)
 
-        # Round 3 Agent 1: reward normalization + exploration bonus
+        # Agent 1 R3: reward normalization + exploration bonus
         reward_rms = RunningMeanStd() if getattr(config, "reward_normalization", False) else None
         exploration = ExplorationBonus(
             num_buckets=getattr(config, "exploration_hash_buckets", 4096),
@@ -201,11 +195,14 @@ def train(config: TrainingConfig):
         clip_vloss = getattr(config, "clip_vloss", False)
         batch_adv_norm = getattr(config, "batch_advantage_norm", False)
 
-        # Frame stacking: maintain per-env frame buffers for CNN path
-        # Each buffer is (frame_stack, H, W) on CPU
+        # R3A2: GPU-side frame stacking buffer
+        use_gpu_preprocess = getattr(config, "gpu_preprocess", True) and device.type == "cuda"
         frame_bufs = None
         if frame_stack > 1 and agent.encoder_type != "siglip":
-            frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32)
+            if use_gpu_preprocess:
+                frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32, device=device)
+            else:
+                frame_bufs = torch.zeros((config.num_envs, frame_stack, input_size, input_size), dtype=torch.float32)
 
         next_obs_list = []
         next_done = torch.zeros(config.num_envs)
@@ -213,17 +210,24 @@ def train(config: TrainingConfig):
             obs, info = env.reset()
             next_obs_list.append(obs)
             reward_shaper.reset_env(i, info)
-        # Preprocess to single-channel grayscale
-        next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
-        # Initialize frame buffers by repeating first frame
-        if frame_bufs is not None:
+
+        # Initial preprocessing
+        if use_gpu_preprocess and frame_bufs is not None:
+            raw_obs_tensor = torch.from_numpy(np.array(next_obs_list)).to(device, non_blocking=True)
+            next_obs_single = preprocess_obs_gpu(raw_obs_tensor, target_size=input_size)
             for i in range(config.num_envs):
                 frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
             next_obs_processed = frame_bufs.clone()
         else:
-            next_obs_processed = next_obs_single
+            next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+            if frame_bufs is not None:
+                for i in range(config.num_envs):
+                    frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
+                next_obs_processed = frame_bufs.clone()
+            else:
+                next_obs_processed = next_obs_single
 
-        # Curriculum learning: start with restricted combat actions, expand later
+        # Curriculum learning
         has_curriculum = hasattr(config, "curriculum_phase1_steps") and hasattr(config, "combat_actions")
         if has_curriculum:
             agent.set_action_mask(config.combat_actions)
@@ -235,14 +239,18 @@ def train(config: TrainingConfig):
         ent_coef_final = getattr(config, "ent_coef_final", config.ent_coef)
 
         budget = getattr(config, "wall_clock_budget", 290.0)
-        logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack})")
+        logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack}, num_envs: {config.num_envs})")
         logger.info(f"Entropy annealing: {ent_coef_start} -> {ent_coef_final}")
         logger.info(f"R3A1: clip_vloss={clip_vloss}, reward_norm={reward_rms is not None}, "
                      f"exploration={exploration is not None}, batch_adv_norm={batch_adv_norm}, "
                      f"lr_warmup={lr_warmup_steps}")
+        logger.info(f"R3A2: gpu_preprocess={use_gpu_preprocess}, pin_memory={use_pin}, torch.compile={agent._compiled}")
 
         use_amp = (device.type == "cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+        # R3A2: Pre-allocate numpy array for raw observations
+        raw_obs_np = np.zeros((config.num_envs,) + next_obs_list[0].shape, dtype=next_obs_list[0].dtype)
 
         for update in range(1, num_updates + 1):
             elapsed = time.time() - start_time
@@ -250,18 +258,16 @@ def train(config: TrainingConfig):
                 logger.info(f"Budget reached at {elapsed:.1f}s")
                 break
 
-            # R3A3: Cosine LR annealing with warmup (better than linear for short training)
+            # R3A3: Cosine LR annealing with warmup
             progress = (update - 1.0) / max(num_updates, 1)
             if lr_warmup_steps > 0 and global_step < lr_warmup_steps:
-                # Linear warmup phase
                 lr = config.learning_rate * (global_step / lr_warmup_steps)
             else:
-                # Cosine decay from peak to ~0
                 lr = config.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
             optimizer.param_groups[0]["lr"] = lr
 
-            # Entropy annealing: linear decay from start to final
-            current_ent_coef = ent_coef_start + (ent_coef_final - ent_coef_start) * (1.0 - frac)
+            # Entropy annealing: linear decay from start to final (fixed: use progress not frac)
+            current_ent_coef = ent_coef_start + (ent_coef_final - ent_coef_start) * progress
 
             # Curriculum: expand to full action space after phase 1
             if has_curriculum and not curriculum_expanded and global_step >= config.curriculum_phase1_steps:
@@ -271,19 +277,28 @@ def train(config: TrainingConfig):
 
             for step in range(config.num_steps):
                 global_step += config.num_envs
-                obs_buf[step] = next_obs_processed
+
+                if use_gpu_preprocess and frame_bufs is not None:
+                    obs_buf[step] = next_obs_processed.cpu()
+                else:
+                    obs_buf[step] = next_obs_processed
                 dones_buf[step] = next_done
 
                 with torch.no_grad():
-                    action, logprob, _, value = agent.get_action_and_value(next_obs_processed.to(device))
+                    if use_gpu_preprocess and frame_bufs is not None:
+                        obs_gpu = next_obs_processed
+                    else:
+                        obs_gpu = next_obs_processed.to(device, non_blocking=use_pin)
+                    action, logprob, _, value = agent.get_action_and_value(obs_gpu)
                     values_buf[step] = value.cpu()
                 actions_buf[step] = action.cpu()
                 logprobs_buf[step] = logprob.cpu()
 
-                next_obs_list = []
+                # R3A2: Collect actions once, step all envs with pre-allocated buffer
+                actions_np = action.cpu().numpy()
                 for i, env in enumerate(envs):
                     try:
-                        obs, raw_reward, terminated, truncated, info = env.step(action[i].item())
+                        obs, raw_reward, terminated, truncated, info = env.step(int(actions_np[i]))
                     except Exception:
                         try:
                             obs, info = env.reset()
@@ -294,9 +309,10 @@ def train(config: TrainingConfig):
                         reward_shaper.reset_env(i, info)
                     done = terminated or truncated
                     shaped_reward = reward_shaper.shape_reward(i, raw_reward, info, done)
-                    # Exploration bonus: reward visiting novel states
+                    # Exploration bonus
                     if exploration is not None:
-                        exp_bonus = exploration.get_bonus(next_obs_processed[i:i+1])
+                        obs_for_bonus = next_obs_processed[i:i+1].cpu() if use_gpu_preprocess else next_obs_processed[i:i+1]
+                        exp_bonus = exploration.get_bonus(obs_for_bonus)
                         shaped_reward += exp_bonus[0]
                     rewards_buf[step, i] = shaped_reward
                     next_done[i] = float(done)
@@ -307,22 +323,32 @@ def train(config: TrainingConfig):
                             envs[i] = make_env(config, i)
                             obs, info = envs[i].reset()
                         reward_shaper.reset_env(i, info)
-                    next_obs_list.append(obs)
+                    raw_obs_np[i] = obs
 
-                next_obs_single = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
-                if frame_bufs is not None:
+                # R3A2: GPU-side preprocessing for frame stacking
+                if use_gpu_preprocess and frame_bufs is not None:
+                    raw_obs_tensor = torch.from_numpy(raw_obs_np).to(device, non_blocking=True)
+                    next_obs_single = preprocess_obs_gpu(raw_obs_tensor, target_size=input_size)
                     for i in range(config.num_envs):
                         if next_done[i]:
-                            # Reset frame buffer on episode end
                             frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
                         else:
-                            # Shift left (drop oldest), append new frame
-                            frame_bufs[i] = torch.cat([frame_bufs[i, 1:], next_obs_single[i, 0:1]], dim=0)
+                            frame_bufs[i] = frame_bufs[i].roll(-1, dims=0)
+                            frame_bufs[i, -1] = next_obs_single[i, 0]
                     next_obs_processed = frame_bufs.clone()
                 else:
-                    next_obs_processed = next_obs_single
+                    next_obs_single = preprocess_obs(raw_obs_np, target_size=input_size, device="cpu")
+                    if frame_bufs is not None:
+                        for i in range(config.num_envs):
+                            if next_done[i]:
+                                frame_bufs[i] = next_obs_single[i, 0:1].expand(frame_stack, -1, -1)
+                            else:
+                                frame_bufs[i] = torch.cat([frame_bufs[i, 1:], next_obs_single[i, 0:1]], dim=0)
+                        next_obs_processed = frame_bufs.clone()
+                    else:
+                        next_obs_processed = next_obs_single
 
-            # Reward normalization: update running stats and normalize
+            # Reward normalization
             if reward_rms is not None:
                 reward_rms.update(rewards_buf.numpy())
                 normalized_rewards = torch.tensor(
@@ -331,8 +357,12 @@ def train(config: TrainingConfig):
             else:
                 normalized_rewards = rewards_buf
 
+            # GAE computation
             with torch.no_grad():
-                next_value = agent.get_value(next_obs_processed.to(device)).squeeze(-1).cpu()
+                if use_gpu_preprocess and frame_bufs is not None:
+                    next_value = agent.get_value(next_obs_processed).squeeze(-1).cpu()
+                else:
+                    next_value = agent.get_value(next_obs_processed.to(device, non_blocking=use_pin)).squeeze(-1).cpu()
                 advantages = torch.zeros_like(rewards_buf)
                 lastgaelam = 0
                 for t in reversed(range(config.num_steps)):
@@ -353,7 +383,7 @@ def train(config: TrainingConfig):
             b_inds = np.arange(batch_size)
             clipfracs = []
 
-            # Batch-level advantage normalization (more stable than per-minibatch)
+            # Batch-level advantage normalization
             if batch_adv_norm:
                 b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
@@ -361,19 +391,19 @@ def train(config: TrainingConfig):
                 np.random.shuffle(b_inds)
                 for start in range(0, batch_size, minibatch_size):
                     mb = b_inds[start:start + minibatch_size]
-                    mb_obs = b_obs[mb].to(device)
-                    mb_act = b_actions[mb].to(device)
-                    mb_lp = b_logprobs[mb].to(device)
-                    mb_adv = b_advantages[mb].to(device)
-                    mb_ret = b_returns[mb].to(device)
-                    mb_val = b_values[mb].to(device) if clip_vloss else None
+                    # R3A2: non_blocking transfer for pinned memory
+                    mb_obs = b_obs[mb].to(device, non_blocking=use_pin)
+                    mb_act = b_actions[mb].to(device, non_blocking=use_pin)
+                    mb_lp = b_logprobs[mb].to(device, non_blocking=use_pin)
+                    mb_adv = b_advantages[mb].to(device, non_blocking=use_pin)
+                    mb_ret = b_returns[mb].to(device, non_blocking=use_pin)
+                    mb_val = b_values[mb].to(device, non_blocking=use_pin) if clip_vloss else None
                     try:
                         with torch.amp.autocast("cuda", enabled=use_amp):
                             _, nlp, ent, nv = agent.get_action_and_value(mb_obs, mb_act)
                             ratio = (nlp - mb_lp).exp()
                             with torch.no_grad():
                                 clipfracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
-                            # Use pre-normalized advantages if batch norm is on, else per-minibatch
                             if batch_adv_norm:
                                 adv = mb_adv
                             else:
@@ -381,7 +411,7 @@ def train(config: TrainingConfig):
                             pg1 = -adv * ratio
                             pg2 = -adv * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
                             pg_loss = torch.max(pg1, pg2).mean()
-                            # Clipped value loss: prevent large value function updates
+                            # Clipped value loss
                             if clip_vloss and mb_val is not None:
                                 v_clipped = mb_val + torch.clamp(nv - mb_val, -config.clip_coef, config.clip_coef)
                                 v_loss_unclipped = (nv - mb_ret) ** 2
@@ -450,7 +480,6 @@ def train(config: TrainingConfig):
     finally:
         results = _save_results(config, global_step, start_time, best_win_rate, competency_reached_at, training_log, best_eval_metrics)
         if agent is not None:
-            # Clear action mask for clean eval-ready checkpoint
             agent.set_action_mask(None)
             try:
                 torch.save(agent.state_dict(), os.path.join(config.checkpoint_dir, "final.pt"))
@@ -476,13 +505,11 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
         return 0.0, {}
 
     wins = surv = dmg_d = dmg_t = g_dmg = 0
-    # Save and clear action mask for evaluation (use all actions)
     saved_mask = agent._action_mask
     agent.set_action_mask(None)
     agent.eval()
     try:
         for ep in range(config.eval_episodes):
-            # Reset frame buffer for clean eval episodes
             if hasattr(agent, "reset_frame_buffer"):
                 agent.reset_frame_buffer()
             try:
@@ -516,7 +543,6 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
                 wins += 1
     finally:
         agent.train()
-        # Restore action mask for training
         agent._action_mask = saved_mask
         try:
             env.close()
