@@ -6,14 +6,15 @@ user_invocable: true
 
 You are the team lead. Read CLAUDE.md first to understand the project.
 
-Each agent has its own git worktree - full independent copy of the repo. No file conflicts.
+IMPORTANT: Use TeamCreate to create an agent TEAM with TEAMMATES (not the Agent tool which creates subagents). Teammates get their own tmux panes, their own git worktrees, and can communicate with each other and with you. Each teammate has a full independent copy of the repo.
 
 COORDINATION RULES:
-- Spawn Agent 1, tell it to declare its approach then start coding immediately.
-- Once you hear Agent 1's approach, spawn Agent 2 telling it what Agent 1 is doing so it picks a DIFFERENT approach. Agent 2 starts immediately after declaring.
-- Same for Agent 3.
-- Agents do NOT wait for approval before implementing. They declare and go.
-- The only shared resource is the GPU. If multiple agents need it, you sequence access.
+- Create the team with TeamCreate, spawning 3 teammates each in their own worktree.
+- Spawn Teammate 1 first, tell it to declare its approach then start coding immediately.
+- Once you hear Teammate 1's approach, spawn Teammate 2 telling it what Teammate 1 is doing so it picks a DIFFERENT approach. Starts immediately after declaring.
+- Same for Teammate 3.
+- Teammates do NOT wait for approval before implementing. They declare and go.
+- The only shared resource is the GPU. If multiple teammates need it, you sequence access.
 - All other work runs fully in parallel.
 
 CURRENT TASK: $ARGUMENTS
