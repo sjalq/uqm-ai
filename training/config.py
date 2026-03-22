@@ -1,10 +1,31 @@
 """
 Training configuration - all hyperparameters in one place.
 
-Agent 2 - Round 1: Tuned for maximum throughput with lightweight CNN.
+Agent 2 - Round 2: Curriculum learning + action masking + entropy annealing.
+Builds on Round 1 lightweight CNN. Shorter rollouts, higher initial LR, fewer epochs.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
+
+
+# 12 useful combat actions (indices into the 32-action space)
+# Each action is a 5-bit mask: [LEFT, RIGHT, THRUST, WEAPON, SPECIAL]
+# Bit 0=LEFT(1), 1=RIGHT(2), 2=THRUST(4), 3=WEAPON(8), 4=SPECIAL(16)
+COMBAT_ACTIONS: List[int] = [
+    0,   # idle
+    1,   # left
+    2,   # right
+    4,   # thrust
+    8,   # fire
+    12,  # thrust + fire (4+8)
+    5,   # left + thrust (1+4)
+    6,   # right + thrust (2+4)
+    9,   # left + fire (1+8)
+    10,  # right + fire (2+8)
+    13,  # left + thrust + fire (1+4+8)
+    14,  # right + thrust + fire (2+4+8)
+]
 
 
 @dataclass
@@ -21,16 +42,23 @@ class TrainingConfig:
     hidden_dim: int = 256
     action_dim: int = 32
 
-    learning_rate: float = 5e-4     # Higher LR for small trainable CNN
-    num_steps: int = 128
+    learning_rate: float = 7e-4       # Higher initial LR for faster convergence
+    num_steps: int = 64               # Shorter rollouts = more frequent updates
     num_minibatches: int = 4
-    update_epochs: int = 4
+    update_epochs: int = 3            # Fewer epochs per update = faster wall-clock
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.02          # Higher entropy for exploration
+    ent_coef: float = 0.05            # Starting entropy (will anneal)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+
+    # Entropy annealing: linearly anneal from ent_coef to ent_coef_final
+    ent_coef_final: float = 0.005
+
+    # Curriculum learning: phase 1 uses restricted combat actions, phase 2 uses all 32
+    curriculum_phase1_steps: int = 80_000   # Steps before expanding to full action space
+    combat_actions: List[int] = field(default_factory=lambda: list(COMBAT_ACTIONS))
 
     total_timesteps: int = 1_000_000
     wall_clock_budget: float = 290.0
@@ -43,3 +71,9 @@ class TrainingConfig:
     output_dir: str = "outputs"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
+
+    # Reward shaping parameters
+    reward_damage_dealt_scale: float = 3.0   # Asymmetric: reward dealing damage 3x
+    reward_damage_taken_scale: float = 1.0   # Penalize taking damage 1x
+    reward_combo_bonus: float = 0.05         # Bonus per consecutive-hit step
+    reward_survival_bonus: float = 0.0005    # Small per-step survival reward

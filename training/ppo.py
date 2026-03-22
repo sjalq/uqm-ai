@@ -1,7 +1,8 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Agent 2 - Round 1: Max throughput, preprocessed obs buffer, mixed precision, robust.
+Agent 1 - Round 2: Dense reward shaping with combo tracking, asymmetric damage,
+and efficiency-scaled terminal rewards on top of Round 1's fast CNN architecture.
 """
 
 import time
@@ -16,6 +17,7 @@ import torch.optim as optim
 
 from training.agent import MeleeAgent, preprocess_obs
 from training.config import TrainingConfig
+from uqm_env.reward import RewardShaper
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +106,26 @@ def train(config: TrainingConfig):
         dones_buf = torch.zeros((config.num_steps, config.num_envs))
         values_buf = torch.zeros((config.num_steps, config.num_envs))
 
+        reward_shaper = RewardShaper(config.num_envs, config)
+
         next_obs_list = []
         next_done = torch.zeros(config.num_envs)
-        for env in envs:
-            obs, _ = env.reset()
+        for i, env in enumerate(envs):
+            obs, info = env.reset()
             next_obs_list.append(obs)
+            reward_shaper.reset_env(i, info)
         next_obs_processed = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
+
+        # Curriculum learning: start with restricted combat actions, expand later
+        has_curriculum = hasattr(config, "curriculum_phase1_steps") and hasattr(config, "combat_actions")
+        if has_curriculum:
+            agent.set_action_mask(config.combat_actions)
+            logger.info(f"Curriculum phase 1: {len(config.combat_actions)} actions until step {config.curriculum_phase1_steps}")
+        curriculum_expanded = False
+
+        # Entropy annealing setup
+        ent_coef_start = config.ent_coef
+        ent_coef_final = getattr(config, "ent_coef_final", config.ent_coef)
 
         budget = getattr(config, "wall_clock_budget", 290.0)
         logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates})")
@@ -127,6 +143,15 @@ def train(config: TrainingConfig):
             lr = frac * config.learning_rate
             optimizer.param_groups[0]["lr"] = lr
 
+            # Entropy annealing: linear decay from start to final
+            current_ent_coef = ent_coef_start + (ent_coef_final - ent_coef_start) * (1.0 - frac)
+
+            # Curriculum: expand to full action space after phase 1
+            if has_curriculum and not curriculum_expanded and global_step >= config.curriculum_phase1_steps:
+                agent.set_action_mask(None)
+                curriculum_expanded = True
+                logger.info(f"Curriculum phase 2: all {config.action_dim} actions unlocked at step {global_step}")
+
             for step in range(config.num_steps):
                 global_step += config.num_envs
                 obs_buf[step] = next_obs_processed
@@ -141,22 +166,26 @@ def train(config: TrainingConfig):
                 next_obs_list = []
                 for i, env in enumerate(envs):
                     try:
-                        obs, reward, terminated, truncated, info = env.step(action[i].item())
+                        obs, raw_reward, terminated, truncated, info = env.step(action[i].item())
                     except Exception:
                         try:
-                            obs, _ = env.reset()
+                            obs, info = env.reset()
                         except Exception:
                             envs[i] = make_env(config, i)
-                            obs, _ = envs[i].reset()
-                        reward, terminated, truncated = 0.0, False, False
-                    rewards_buf[step, i] = reward
-                    next_done[i] = float(terminated or truncated)
-                    if terminated or truncated:
+                            obs, info = envs[i].reset()
+                        raw_reward, terminated, truncated = 0.0, False, False
+                        reward_shaper.reset_env(i, info)
+                    done = terminated or truncated
+                    shaped_reward = reward_shaper.shape_reward(i, raw_reward, info, done)
+                    rewards_buf[step, i] = shaped_reward
+                    next_done[i] = float(done)
+                    if done:
                         try:
-                            obs, _ = env.reset()
+                            obs, info = env.reset()
                         except Exception:
                             envs[i] = make_env(config, i)
-                            obs, _ = envs[i].reset()
+                            obs, info = envs[i].reset()
+                        reward_shaper.reset_env(i, info)
                     next_obs_list.append(obs)
 
                 next_obs_processed = preprocess_obs(np.array(next_obs_list), target_size=input_size, device="cpu")
@@ -203,7 +232,7 @@ def train(config: TrainingConfig):
                             pg_loss = torch.max(pg1, pg2).mean()
                             v_loss = 0.5 * ((nv - mb_ret) ** 2).mean()
                             entropy_loss = ent.mean()
-                            loss = pg_loss - config.ent_coef * entropy_loss + config.vf_coef * v_loss
+                            loss = pg_loss - current_ent_coef * entropy_loss + config.vf_coef * v_loss
                         optimizer.zero_grad()
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
@@ -285,6 +314,9 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
         return 0.0, {}
 
     wins = surv = dmg_d = dmg_t = g_dmg = 0
+    # Save and clear action mask for evaluation (use all actions)
+    saved_mask = agent._action_mask
+    agent.set_action_mask(None)
     agent.eval()
     try:
         for ep in range(config.eval_episodes):
@@ -319,6 +351,8 @@ def evaluate_agent(agent, config: TrainingConfig, device=None) -> tuple:
                 wins += 1
     finally:
         agent.train()
+        # Restore action mask for training
+        agent._action_mask = saved_mask
         try:
             env.close()
         except Exception:
