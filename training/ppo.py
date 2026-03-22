@@ -1,8 +1,12 @@
 """
 PPO training for UQM Melee - CleanRL single-file style.
 
-Round 2 combined: Dense reward shaping (Agent 1), curriculum learning + action masking +
-entropy annealing (Agent 2), frame stacking (Agent 3).
+Round 3 Agent 1: Improved value learning + exploration.
+- Clipped value loss for stable value function updates
+- Running mean/std reward normalization
+- Hash-based exploration bonus for state coverage
+- Batch-level advantage normalization
+- LR warmup for early training stability
 """
 
 import time
@@ -20,6 +24,74 @@ from training.config import TrainingConfig
 from uqm_env.reward import RewardShaper
 
 logger = logging.getLogger(__name__)
+
+
+class RunningMeanStd:
+    """Welford's online algorithm for running mean/variance."""
+
+    def __init__(self, epsilon=1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon
+
+    def update(self, x):
+        """Update with a batch of values (numpy array or scalar)."""
+        batch = np.asarray(x).ravel()
+        batch_mean = batch.mean()
+        batch_var = batch.var()
+        batch_count = len(batch)
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
+        self.mean = new_mean
+        self.var = m2 / tot_count
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
+class ExplorationBonus:
+    """Hash-based state visitation counting for exploration bonus."""
+
+    def __init__(self, num_buckets=4096, coef=0.01):
+        self.num_buckets = num_buckets
+        self.coef = coef
+        self.counts = np.zeros(num_buckets, dtype=np.float64)
+
+    def _hash_obs(self, obs_tensor):
+        """Hash observation to a bucket. obs_tensor: (C, H, W) float."""
+        # Downsample to 8x8 and discretize for fast hashing
+        flat = obs_tensor.reshape(-1)
+        # Use a subset of pixels for speed
+        stride = max(1, len(flat) // 64)
+        key_pixels = flat[::stride]
+        # Simple hash: discretize to 16 levels, compute polynomial hash
+        discretized = (key_pixels * 15).int().numpy().astype(np.int64)
+        h = 0
+        for v in discretized:
+            h = (h * 31 + v) % self.num_buckets
+        return int(h)
+
+    def get_bonus(self, obs_batch):
+        """
+        Compute exploration bonus for a batch of observations.
+        obs_batch: (B, C, H, W) tensor on CPU.
+        Returns: numpy array of bonuses (B,)
+        """
+        bonuses = np.zeros(obs_batch.shape[0])
+        for i in range(obs_batch.shape[0]):
+            h = self._hash_obs(obs_batch[i])
+            self.counts[h] += 1.0
+            # Bonus proportional to 1/sqrt(count) - decreases with visits
+            bonuses[i] = self.coef / np.sqrt(self.counts[h])
+        return bonuses
 
 
 def make_env(config: TrainingConfig, env_id: int = 0):
@@ -117,6 +189,16 @@ def train(config: TrainingConfig):
 
         reward_shaper = RewardShaper(config.num_envs, config)
 
+        # Round 3 Agent 1: reward normalization + exploration bonus
+        reward_rms = RunningMeanStd() if getattr(config, "reward_normalization", False) else None
+        exploration = ExplorationBonus(
+            num_buckets=getattr(config, "exploration_hash_buckets", 4096),
+            coef=getattr(config, "exploration_bonus_coef", 0.01),
+        ) if getattr(config, "exploration_bonus", False) else None
+        lr_warmup_steps = getattr(config, "lr_warmup_steps", 0)
+        clip_vloss = getattr(config, "clip_vloss", False)
+        batch_adv_norm = getattr(config, "batch_advantage_norm", False)
+
         # Frame stacking: maintain per-env frame buffers for CNN path
         # Each buffer is (frame_stack, H, W) on CPU
         frame_bufs = None
@@ -153,6 +235,9 @@ def train(config: TrainingConfig):
         budget = getattr(config, "wall_clock_budget", 290.0)
         logger.info(f"Starting PPO (budget: {budget:.0f}s, batch: {batch_size}, updates: {num_updates}, frame_stack: {frame_stack})")
         logger.info(f"Entropy annealing: {ent_coef_start} -> {ent_coef_final}")
+        logger.info(f"R3A1: clip_vloss={clip_vloss}, reward_norm={reward_rms is not None}, "
+                     f"exploration={exploration is not None}, batch_adv_norm={batch_adv_norm}, "
+                     f"lr_warmup={lr_warmup_steps}")
 
         use_amp = (device.type == "cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -165,6 +250,10 @@ def train(config: TrainingConfig):
 
             frac = 1.0 - (update - 1.0) / num_updates
             lr = frac * config.learning_rate
+            # LR warmup: linear ramp from 0 to scheduled LR over warmup steps
+            if lr_warmup_steps > 0 and global_step < lr_warmup_steps:
+                warmup_frac = global_step / lr_warmup_steps
+                lr = lr * warmup_frac
             optimizer.param_groups[0]["lr"] = lr
 
             # Entropy annealing: linear decay from start to final
@@ -201,6 +290,10 @@ def train(config: TrainingConfig):
                         reward_shaper.reset_env(i, info)
                     done = terminated or truncated
                     shaped_reward = reward_shaper.shape_reward(i, raw_reward, info, done)
+                    # Exploration bonus: reward visiting novel states
+                    if exploration is not None:
+                        exp_bonus = exploration.get_bonus(next_obs_processed[i:i+1])
+                        shaped_reward += exp_bonus[0]
                     rewards_buf[step, i] = shaped_reward
                     next_done[i] = float(done)
                     if done:
@@ -225,6 +318,15 @@ def train(config: TrainingConfig):
                 else:
                     next_obs_processed = next_obs_single
 
+            # Reward normalization: update running stats and normalize
+            if reward_rms is not None:
+                reward_rms.update(rewards_buf.numpy())
+                normalized_rewards = torch.tensor(
+                    reward_rms.normalize(rewards_buf.numpy()), dtype=torch.float32
+                )
+            else:
+                normalized_rewards = rewards_buf
+
             with torch.no_grad():
                 next_value = agent.get_value(next_obs_processed.to(device)).squeeze(-1).cpu()
                 advantages = torch.zeros_like(rewards_buf)
@@ -234,7 +336,7 @@ def train(config: TrainingConfig):
                         nnt, nv = 1.0 - next_done, next_value
                     else:
                         nnt, nv = 1.0 - dones_buf[t + 1], values_buf[t + 1]
-                    delta = rewards_buf[t] + config.gamma * nv * nnt - values_buf[t]
+                    delta = normalized_rewards[t] + config.gamma * nv * nnt - values_buf[t]
                     advantages[t] = lastgaelam = delta + config.gamma * config.gae_lambda * nnt * lastgaelam
                 returns = advantages + values_buf
 
@@ -243,8 +345,13 @@ def train(config: TrainingConfig):
             b_actions = actions_buf.reshape(-1)
             b_advantages = advantages.reshape(-1)
             b_returns = returns.reshape(-1)
+            b_values = values_buf.reshape(-1)
             b_inds = np.arange(batch_size)
             clipfracs = []
+
+            # Batch-level advantage normalization (more stable than per-minibatch)
+            if batch_adv_norm:
+                b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
             for epoch in range(config.update_epochs):
                 np.random.shuffle(b_inds)
@@ -255,17 +362,29 @@ def train(config: TrainingConfig):
                     mb_lp = b_logprobs[mb].to(device)
                     mb_adv = b_advantages[mb].to(device)
                     mb_ret = b_returns[mb].to(device)
+                    mb_val = b_values[mb].to(device) if clip_vloss else None
                     try:
                         with torch.amp.autocast("cuda", enabled=use_amp):
                             _, nlp, ent, nv = agent.get_action_and_value(mb_obs, mb_act)
                             ratio = (nlp - mb_lp).exp()
                             with torch.no_grad():
                                 clipfracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
-                            adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                            # Use pre-normalized advantages if batch norm is on, else per-minibatch
+                            if batch_adv_norm:
+                                adv = mb_adv
+                            else:
+                                adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                             pg1 = -adv * ratio
                             pg2 = -adv * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
                             pg_loss = torch.max(pg1, pg2).mean()
-                            v_loss = 0.5 * ((nv - mb_ret) ** 2).mean()
+                            # Clipped value loss: prevent large value function updates
+                            if clip_vloss and mb_val is not None:
+                                v_clipped = mb_val + torch.clamp(nv - mb_val, -config.clip_coef, config.clip_coef)
+                                v_loss_unclipped = (nv - mb_ret) ** 2
+                                v_loss_clipped = (v_clipped - mb_ret) ** 2
+                                v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                            else:
+                                v_loss = 0.5 * ((nv - mb_ret) ** 2).mean()
                             entropy_loss = ent.mean()
                             loss = pg_loss - current_ent_coef * entropy_loss + config.vf_coef * v_loss
                         optimizer.zero_grad()
